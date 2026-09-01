@@ -1,29 +1,38 @@
 #include "HX711.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <math.h>
 
 // ============================================================
-//        BANCO DE PRUEBAS MOTOR BLDC
+//       BANCO DE PRUEBAS MOTOR BLDC
 //
-//   VELOCIDAD + GALGA + FUERZA + TORQUE
-//   + WiFi + MQTT
-//
+// RPM + HX711 + KALMAN + PALANCA + TORQUE
+// + USB SERIAL + WIFI + MQTT
 // ============================================================
+
+
+// ============================================================
+// MEDIOS DE TRANSMISION
+// ============================================================
+
+// El mismo JSON se manda por ambos medios.
+const bool ENABLE_USB_DATA = true;
+const bool ENABLE_MQTT     = true;
 
 
 // ============================================================
 // WIFI
 // ============================================================
 
-const char* WIFI_SSID = "Claro_6E09BE";
-const char* WIFI_PASSWORD = "A9Y9A3W2Y3S4";
+const char* WIFI_SSID = "IPJAS";
+const char* WIFI_PASSWORD = "TU_CONTRASENA_WIFI";
 
 
 // ============================================================
 // MQTT
 // ============================================================
 
-const char* MQTT_SERVER = "192.168.20.24";
+const char* MQTT_SERVER = "172.20.10.2";
 const int MQTT_PORT = 1883;
 
 const char* MQTT_TOPIC = "micro1/motor1/telemetry";
@@ -31,32 +40,32 @@ const char* MQTT_TOPIC = "micro1/motor1/telemetry";
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
-unsigned long sequence = 0;
+uint32_t sequence = 0;
+
+uint32_t lastWiFiAttemptMs = 0;
+uint32_t lastMQTTAttemptMs = 0;
 
 
 // ============================================================
 // PINES
 // ============================================================
 
-// HX711
 #define HX711_DOUT  1
 #define HX711_SCK   2
 
-// Señal de velocidad
 #define SPEED_PIN   8
 
 HX711 scale;
 
 
 // ============================================================
-// CALIBRACION DE LA GALGA
+// CALIBRACION GALGA
 // ============================================================
 
+// Masa [g] = pendiente * (RAW - CeroFinal)
 const double MASS_SLOPE = 0.0006589883;
 
 const double GRAVITY = 9.80665;
-
-const double TORQUE_ARM_M = 0.020;
 
 const int ZERO_SAMPLES = 30;
 
@@ -66,11 +75,50 @@ double zeroRaw = 0.0;
 
 
 // ============================================================
-// CALIBRACION DE VELOCIDAD
+// GEOMETRIA DE LA PALANCA
+// ============================================================
+//
+// Centro iman ---- 6 cm ---- PIVOTE ---- 4 cm ---- GALGA
+//
+// Equilibrio:
+//
+// F_iman * 0.06 = F_galga * 0.04
+//
+// F_iman = F_galga * 0.04 / 0.06
+//
+// Torque = F_iman * 0.06
+//
+// equivalente:
+//
+// Torque = F_galga * 0.04
+//
+// ============================================================
+
+const double MAGNET_TO_PIVOT_M = 0.060;
+
+const double PIVOT_TO_LOADCELL_M = 0.040;
+
+
+// ============================================================
+// FILTRO KALMAN GALGA
+// ============================================================
+
+const double KALMAN_Q = 0.05;
+const double KALMAN_R = 1.00;
+
+double kalmanMassEstimate = 0.0;
+double kalmanErrorEstimate = 1.0;
+double kalmanGain = 0.0;
+
+bool kalmanInitialized = false;
+
+
+// ============================================================
+// CONFIGURACION VELOCIDAD
 // ============================================================
 
 const float TRANSITIONS_PER_REV = 12.0;
-const float PULSES_PER_REV      = 6.0;
+const float PULSES_PER_REV = 6.0;
 
 const uint32_t REPORT_INTERVAL_MS = 500;
 
@@ -82,7 +130,7 @@ const float RPM_AGREEMENT_PERCENT = 2.0;
 
 
 // ============================================================
-// VARIABLES DE INTERRUPCION
+// INTERRUPCIONES TACOMETRO
 // ============================================================
 
 volatile uint32_t edgeCount = 0;
@@ -101,7 +149,7 @@ volatile uint32_t risePeriodUs = 0;
 
 
 // ============================================================
-// VARIABLES GENERALES
+// VARIABLES RPM
 // ============================================================
 
 float filteredRPM = 0.0;
@@ -111,23 +159,86 @@ bool filterInitialized = false;
 
 
 // ============================================================
-// INTERRUPCION VELOCIDAD
+// RESET KALMAN
+// ============================================================
+
+void resetKalman()
+{
+  kalmanMassEstimate = 0.0;
+  kalmanErrorEstimate = 1.0;
+  kalmanGain = 0.0;
+
+  kalmanInitialized = true;
+}
+
+
+// ============================================================
+// FILTRO KALMAN
+// ============================================================
+
+double applyKalman(double measurement)
+{
+  if (!kalmanInitialized)
+  {
+    kalmanMassEstimate = measurement;
+    kalmanErrorEstimate = 1.0;
+    kalmanGain = 1.0;
+
+    kalmanInitialized = true;
+
+    return kalmanMassEstimate;
+  }
+
+  // Prediccion
+  double predictedEstimate =
+    kalmanMassEstimate;
+
+  double predictedError =
+    kalmanErrorEstimate + KALMAN_Q;
+
+
+  // Ganancia Kalman
+  kalmanGain =
+    predictedError /
+    (predictedError + KALMAN_R);
+
+
+  // Correccion
+  kalmanMassEstimate =
+    predictedEstimate +
+    kalmanGain *
+    (measurement - predictedEstimate);
+
+
+  // Error actualizado
+  kalmanErrorEstimate =
+    (1.0 - kalmanGain) *
+    predictedError;
+
+
+  return kalmanMassEstimate;
+}
+
+
+// ============================================================
+// ISR VELOCIDAD
 // ============================================================
 
 void IRAM_ATTR speedISR()
 {
   uint32_t now = micros();
 
-  bool state = digitalRead(SPEED_PIN);
+  bool state =
+    digitalRead(SPEED_PIN);
 
   edgeCount++;
 
   lastEdgeUs = now;
 
 
-  // ==========================================================
+  // ----------------------------------------------------------
   // FLANCO ASCENDENTE
-  // ==========================================================
+  // ----------------------------------------------------------
 
   if (state == HIGH)
   {
@@ -135,21 +246,23 @@ void IRAM_ATTR speedISR()
 
     if (lastRiseUs != 0)
     {
-      risePeriodUs = now - lastRiseUs;
+      risePeriodUs =
+        now - lastRiseUs;
     }
 
     if (lastFallUs != 0)
     {
-      lowTimeUs = now - lastFallUs;
+      lowTimeUs =
+        now - lastFallUs;
     }
 
     lastRiseUs = now;
   }
 
 
-  // ==========================================================
+  // ----------------------------------------------------------
   // FLANCO DESCENDENTE
-  // ==========================================================
+  // ----------------------------------------------------------
 
   else
   {
@@ -157,7 +270,8 @@ void IRAM_ATTR speedISR()
 
     if (lastRiseUs != 0)
     {
-      highTimeUs = now - lastRiseUs;
+      highTimeUs =
+        now - lastRiseUs;
     }
 
     lastFallUs = now;
@@ -166,66 +280,7 @@ void IRAM_ATTR speedISR()
 
 
 // ============================================================
-// CONECTAR WIFI
-// ============================================================
-
-void conectarWiFi()
-{
-  Serial.println();
-  Serial.println("Conectando al WiFi...");
-
-  WiFi.mode(WIFI_STA);
-
-  WiFi.begin(
-    WIFI_SSID,
-    WIFI_PASSWORD
-  );
-
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.println("WiFi conectado correctamente.");
-
-  Serial.print("IP ESP32: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.print("RSSI: ");
-  Serial.print(WiFi.RSSI());
-  Serial.println(" dBm");
-}
-
-
-// ============================================================
-// CONECTAR MQTT
-// ============================================================
-
-void conectarMQTT()
-{
-  while (!mqttClient.connected())
-  {
-    Serial.print("Conectando MQTT... ");
-
-    if (mqttClient.connect("ESP32_Micro1"))
-    {
-      Serial.println("OK");
-    }
-    else
-    {
-      Serial.print("ERROR = ");
-      Serial.println(mqttClient.state());
-
-      delay(2000);
-    }
-  }
-}
-
-
-// ============================================================
-// ESPERAR HX711
+// HX711
 // ============================================================
 
 bool waitForHX711(unsigned long timeoutMs)
@@ -234,7 +289,9 @@ bool waitForHX711(unsigned long timeoutMs)
 
   while (!scale.is_ready())
   {
-    if (millis() - start >= timeoutMs)
+    if (
+      millis() - start >= timeoutMs
+    )
     {
       return false;
     }
@@ -250,7 +307,10 @@ bool waitForHX711(unsigned long timeoutMs)
 // PROMEDIO RAW
 // ============================================================
 
-bool readAverageRaw(int samples, double &result)
+bool readAverageRaw(
+  int samples,
+  double &result
+)
 {
   double sum = 0.0;
 
@@ -261,12 +321,14 @@ bool readAverageRaw(int samples, double &result)
       return false;
     }
 
-    long raw = scale.read();
+    long raw =
+      scale.read();
 
     sum += raw;
   }
 
-  result = sum / samples;
+  result =
+    sum / samples;
 
   return true;
 }
@@ -283,7 +345,8 @@ char readOption()
     delay(10);
   }
 
-  char option = Serial.read();
+  char option =
+    Serial.read();
 
   delay(50);
 
@@ -317,7 +380,7 @@ double readSerialNumber()
 
 
 // ============================================================
-// CONFIGURAR CERO GALGA
+// TARA INICIAL
 // ============================================================
 
 void configureLoadCellZero()
@@ -328,39 +391,27 @@ void configureLoadCellZero()
   Serial.println("======================================================");
   Serial.println();
 
-  Serial.println("Pendiente de calibracion guardada:");
-
+  Serial.print("Pendiente calibracion = ");
   Serial.print(MASS_SLOPE, 10);
   Serial.println(" g/count");
 
   Serial.println();
 
-  Serial.println("NO es necesario repetir calibracion con masas.");
-
-  Serial.println();
-  Serial.println("Ahora necesitamos CeroFinal.");
-
-  Serial.println();
   Serial.println("La galga debe estar:");
-
-  Serial.println("  - SIN plataforma de calibracion.");
-  Serial.println("  - Instalada en el montaje final.");
-  Serial.println("  - SIN fuerza aplicada.");
-  Serial.println("  - Con el motor detenido.");
+  Serial.println(" - Instalada en el montaje.");
+  Serial.println(" - Sin fuerza aplicada.");
+  Serial.println(" - Motor detenido.");
 
   Serial.println();
 
-  Serial.println("Seleccione:");
-
-  Serial.println();
-
-  Serial.println("1 = Hacer tara / cero automaticamente");
-  Serial.println("2 = Introducir CeroFinal manualmente");
+  Serial.println("1 = Tara automatica");
+  Serial.println("2 = Introducir CeroFinal manual");
 
   Serial.println();
 
 
-  char option = readOption();
+  char option =
+    readOption();
 
 
   // ==========================================================
@@ -370,23 +421,22 @@ void configureLoadCellZero()
   if (option == '1')
   {
     Serial.println();
-
     Serial.println("TARA AUTOMATICA");
-    Serial.println("------------------------------");
-
-    Serial.println();
-
-    Serial.println("No toque el montaje.");
-    Serial.println("Midiendo cero...");
-
-    Serial.println();
+    Serial.println("No toque el montaje...");
 
     delay(1500);
 
 
-    if (!readAverageRaw(ZERO_SAMPLES, zeroRaw))
+    if (
+      !readAverageRaw(
+        ZERO_SAMPLES,
+        zeroRaw
+      )
+    )
     {
-      Serial.println("ERROR: HX711 no responde.");
+      Serial.println(
+        "ERROR: HX711 no responde."
+      );
 
       while (1)
       {
@@ -397,10 +447,6 @@ void configureLoadCellZero()
 
     Serial.print("CeroFinal = ");
     Serial.println(zeroRaw, 2);
-
-    Serial.println();
-
-    Serial.println("Tara realizada correctamente.");
   }
 
 
@@ -411,37 +457,41 @@ void configureLoadCellZero()
   else if (option == '2')
   {
     Serial.println();
+    Serial.println(
+      "Introduzca CeroFinal:"
+    );
 
-    Serial.println("Introduzca el valor RAW de CeroFinal:");
+    zeroRaw =
+      readSerialNumber();
 
-    Serial.println();
-
-    zeroRaw = readSerialNumber();
-
-    Serial.println();
-
-    Serial.print("CeroFinal introducido = ");
+    Serial.print("CeroFinal = ");
     Serial.println(zeroRaw, 2);
   }
 
 
   // ==========================================================
-  // OPCION INVALIDA
+  // OPCION INVALIDA -> TARA AUTOMATICA
   // ==========================================================
 
   else
   {
-    Serial.println();
-
-    Serial.println("Opcion invalida.");
-    Serial.println("Se realizara tara automaticamente.");
+    Serial.println(
+      "Opcion invalida. Tara automatica..."
+    );
 
     delay(1500);
 
 
-    if (!readAverageRaw(ZERO_SAMPLES, zeroRaw))
+    if (
+      !readAverageRaw(
+        ZERO_SAMPLES,
+        zeroRaw
+      )
+    )
     {
-      Serial.println("ERROR: HX711 no responde.");
+      Serial.println(
+        "ERROR HX711"
+      );
 
       while (1)
       {
@@ -455,21 +505,156 @@ void configureLoadCellZero()
   }
 
 
-  Serial.println();
+  resetKalman();
 
-  Serial.println("Ecuacion utilizada:");
-
-  Serial.println();
-
-  Serial.print("Masa[g] = ");
-  Serial.print(MASS_SLOPE, 10);
-  Serial.println(" * (RAW - CeroFinal)");
 
   Serial.println();
 
-  Serial.println("Configuracion de galga terminada.");
+  Serial.println(
+    "Geometria:"
+  );
 
-  Serial.println("======================================================");
+  Serial.println(
+    "Iman -> pivote = 6 cm"
+  );
+
+  Serial.println(
+    "Pivote -> galga = 4 cm"
+  );
+
+  Serial.println();
+
+  Serial.println(
+    "Torque = F_galga * 0.04"
+  );
+
+  Serial.println();
+}
+
+
+// ============================================================
+// INICIAR WIFI
+//
+// IMPORTANTE:
+// NO bloquea el programa.
+// Si no hay WiFi, USB sigue funcionando.
+// ============================================================
+
+void iniciarWiFi()
+{
+  if (!ENABLE_MQTT)
+  {
+    return;
+  }
+
+  Serial.println();
+  Serial.println(
+    "Iniciando WiFi..."
+  );
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  lastWiFiAttemptMs =
+    millis();
+}
+
+
+// ============================================================
+// MANTENER WIFI + MQTT
+//
+// No bloquea la adquisicion.
+// ============================================================
+
+void mantenerRed()
+{
+  if (!ENABLE_MQTT)
+  {
+    return;
+  }
+
+
+  // ==========================================================
+  // WIFI
+  // ==========================================================
+
+  if (
+    WiFi.status()
+    != WL_CONNECTED
+  )
+  {
+    if (
+      millis() -
+      lastWiFiAttemptMs
+      >= 5000
+    )
+    {
+      lastWiFiAttemptMs =
+        millis();
+
+      Serial.println(
+        "Reintentando WiFi..."
+      );
+
+      WiFi.disconnect();
+
+      WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASSWORD
+      );
+    }
+
+    return;
+  }
+
+
+  // ==========================================================
+  // MQTT
+  // ==========================================================
+
+  if (!mqttClient.connected())
+  {
+    if (
+      millis() -
+      lastMQTTAttemptMs
+      >= 3000
+    )
+    {
+      lastMQTTAttemptMs =
+        millis();
+
+      Serial.print(
+        "Conectando MQTT... "
+      );
+
+
+      if (
+        mqttClient.connect(
+          "ESP32_Micro1"
+        )
+      )
+      {
+        Serial.println("OK");
+      }
+
+      else
+      {
+        Serial.print("ERROR ");
+        Serial.println(
+          mqttClient.state()
+        );
+      }
+    }
+
+    return;
+  }
+
+
+  mqttClient.loop();
 }
 
 
@@ -486,10 +671,9 @@ void setup()
 
   Serial.println();
   Serial.println("======================================================");
-  Serial.println("      BANCO DE PRUEBAS MOTOR BLDC");
-  Serial.println(" VELOCIDAD + FUERZA + TORQUE + MQTT");
+  Serial.println("       BANCO DE PRUEBAS MOTOR BLDC");
+  Serial.println(" RPM + TORQUE + USB + WIFI + MQTT");
   Serial.println("======================================================");
-  Serial.println();
 
 
   // ==========================================================
@@ -502,21 +686,16 @@ void setup()
   );
 
 
-  Serial.println("Buscando HX711...");
+  Serial.println(
+    "Buscando HX711..."
+  );
 
 
   if (!waitForHX711(5000))
   {
-    Serial.println();
-    Serial.println("ERROR: HX711 no encontrado.");
-
-    Serial.println();
-
-    Serial.println("Revise:");
-    Serial.println("DT  -> GPIO 1");
-    Serial.println("SCK -> GPIO 2");
-    Serial.println("VCC");
-    Serial.println("GND");
+    Serial.println(
+      "ERROR: HX711 no encontrado."
+    );
 
     while (1)
     {
@@ -525,7 +704,9 @@ void setup()
   }
 
 
-  Serial.println("HX711 encontrado correctamente.");
+  Serial.println(
+    "HX711 encontrado correctamente."
+  );
 
 
   // ==========================================================
@@ -538,11 +719,6 @@ void setup()
   // ==========================================================
   // TACOMETRO
   // ==========================================================
-
-  Serial.println();
-
-  Serial.println("Configurando sensor de velocidad...");
-
 
   pinMode(
     SPEED_PIN,
@@ -557,46 +733,34 @@ void setup()
   );
 
 
-  Serial.println("Sensor de velocidad listo.");
-
-  Serial.println();
-
-  Serial.println("12 transiciones / vuelta");
-  Serial.println("6 pulsos / vuelta");
-
-
-  // ==========================================================
-  // WIFI
-  // ==========================================================
-
-  conectarWiFi();
+  Serial.println(
+    "Tacometro listo."
+  );
 
 
   // ==========================================================
   // MQTT
   // ==========================================================
 
-  mqttClient.setServer(
-    MQTT_SERVER,
-    MQTT_PORT
-  );
+  if (ENABLE_MQTT)
+  {
+    mqttClient.setServer(
+      MQTT_SERVER,
+      MQTT_PORT
+    );
 
-  // IMPORTANTE:
-  // Aumentar tamaño permitido del paquete MQTT
-  mqttClient.setBufferSize(1024);
+    mqttClient.setBufferSize(
+      1600
+    );
 
-  conectarMQTT();
+    iniciarWiFi();
+  }
 
 
   Serial.println();
-
   Serial.println("======================================================");
   Serial.println("           INICIANDO MEDICION");
   Serial.println("======================================================");
-
-  Serial.println();
-
-  Serial.println("Puede iniciar el motor.");
 }
 
 
@@ -606,33 +770,16 @@ void setup()
 
 void loop()
 {
-  static uint32_t previousReportMs = millis();
+  static uint32_t previousReportMs =
+    millis();
+
+
+  // Mantener red sin bloquear
+  mantenerRed();
 
 
   // ==========================================================
-  // MANTENER WIFI
-  // ==========================================================
-
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    conectarWiFi();
-  }
-
-
-  // ==========================================================
-  // MANTENER MQTT
-  // ==========================================================
-
-  if (!mqttClient.connected())
-  {
-    conectarMQTT();
-  }
-
-  mqttClient.loop();
-
-
-  // ==========================================================
-  // REPORTE
+  // MEDICION CADA 500 ms
   // ==========================================================
 
   if (
@@ -640,48 +787,63 @@ void loop()
     >= REPORT_INTERVAL_MS
   )
   {
-    uint32_t nowMs = millis();
+    uint32_t nowMs =
+      millis();
+
 
     uint32_t elapsedMs =
-      nowMs - previousReportMs;
+      nowMs -
+      previousReportMs;
 
-    previousReportMs = nowMs;
+
+    previousReportMs =
+      nowMs;
 
 
     float elapsedSeconds =
-      elapsedMs / 1000.0;
+      elapsedMs /
+      1000.0;
 
 
     // ========================================================
-    // COPIAR DATOS INTERRUPCION
+    // COPIAR DATOS DE INTERRUPCION
     // ========================================================
 
     noInterrupts();
 
-    uint32_t edges = edgeCount;
 
-    uint32_t rises = risingCount;
+    uint32_t edges =
+      edgeCount;
 
-    uint32_t falls = fallingCount;
+    uint32_t rises =
+      risingCount;
 
-    uint32_t lastEdge = lastEdgeUs;
+    uint32_t falls =
+      fallingCount;
 
-    uint32_t period = risePeriodUs;
+    uint32_t lastEdge =
+      lastEdgeUs;
 
-    uint32_t highUs = highTimeUs;
+    uint32_t period =
+      risePeriodUs;
 
-    uint32_t lowUs = lowTimeUs;
+    uint32_t highUs =
+      highTimeUs;
+
+    uint32_t lowUs =
+      lowTimeUs;
 
 
     edgeCount = 0;
     risingCount = 0;
     fallingCount = 0;
 
+
     interrupts();
 
 
     // ========================================================
-    // DETECTAR MOVIMIENTO
+    // MOTOR ACTIVO
     // ========================================================
 
     bool signalActive = false;
@@ -689,16 +851,18 @@ void loop()
 
     if (lastEdge != 0)
     {
-      uint32_t timeSinceLastEdge =
-        micros() - lastEdge;
+      uint32_t dt =
+        micros() -
+        lastEdge;
 
 
       if (
-        timeSinceLastEdge
-        < SIGNAL_TIMEOUT_US
+        dt <
+        SIGNAL_TIMEOUT_US
       )
       {
-        signalActive = true;
+        signalActive =
+          true;
       }
     }
 
@@ -731,50 +895,47 @@ void loop()
     if (signalActive)
     {
       transitionsPerSecond =
-        edges / elapsedSeconds;
+        edges /
+        elapsedSeconds;
 
 
       pulseFrequencyCount =
-        rises / elapsedSeconds;
+        rises /
+        elapsedSeconds;
 
 
-      // ======================================================
-      // RPM CONTEO
-      // ======================================================
-
+      // RPM conteo
       rpmCount =
         (
-          transitionsPerSecond * 60.0
+          transitionsPerSecond *
+          60.0
         )
         /
         TRANSITIONS_PER_REV;
 
 
-      // ======================================================
-      // RPM PERIODO
-      // ======================================================
-
+      // RPM periodo
       if (period > 0)
       {
         pulseFrequencyPeriod =
-          1000000.0 / period;
+          1000000.0 /
+          period;
 
 
         rpmPeriod =
           (
-            pulseFrequencyPeriod * 60.0
+            pulseFrequencyPeriod *
+            60.0
           )
           /
           PULSES_PER_REV;
       }
 
 
-      // ======================================================
-      // DUTY
-      // ======================================================
-
+      // Duty
       uint32_t pulseTime =
-        highUs + lowUs;
+        highUs +
+        lowUs;
 
 
       if (pulseTime > 0)
@@ -794,23 +955,32 @@ void loop()
 
       if (!filterInitialized)
       {
-        filteredRPM = rpmCount;
+        filteredRPM =
+          rpmCount;
 
-        filterInitialized = true;
+        filterInitialized =
+          true;
       }
+
       else
       {
         filteredRPM =
-          FILTER_ALPHA * rpmCount
+          FILTER_ALPHA *
+          rpmCount
           +
-          (1.0 - FILTER_ALPHA)
+          (
+            1.0 -
+            FILTER_ALPHA
+          )
           *
           filteredRPM;
       }
 
 
       // ======================================================
-      // CONCORDANCIA
+      // RPM FINAL
+      //
+      // Solo cambia cuando ambos metodos concuerdan.
       // ======================================================
 
       if (
@@ -833,10 +1003,12 @@ void loop()
 
         if (
           rpmDifferencePercent
-          <= RPM_AGREEMENT_PERCENT
+          <=
+          RPM_AGREEMENT_PERCENT
         )
         {
-          rpmAgreement = true;
+          rpmAgreement =
+            true;
 
 
           finalRPM =
@@ -852,7 +1024,7 @@ void loop()
 
 
     // ========================================================
-    // MOTOR DETENIDO
+    // MOTOR APAGADO
     // ========================================================
 
     else
@@ -891,9 +1063,13 @@ void loop()
       );
 
 
-    double mass_g = 0.0;
+    double massUnfiltered_g = 0.0;
 
-    double force_N = 0.0;
+    double massFiltered_g = 0.0;
+
+    double forceLoadCell_N = 0.0;
+
+    double forceMagnet_N = 0.0;
 
     double torque_Nm = 0.0;
 
@@ -901,7 +1077,7 @@ void loop()
     if (hxOK)
     {
       // Masa
-      mass_g =
+      massUnfiltered_g =
         MASS_SLOPE *
         (
           raw -
@@ -909,133 +1085,134 @@ void loop()
         );
 
 
-      // Fuerza
-      force_N =
+      // Kalman
+      massFiltered_g =
+        applyKalman(
+          massUnfiltered_g
+        );
+
+
+      // Fuerza galga
+      forceLoadCell_N =
         (
-          mass_g /
+          massFiltered_g /
           1000.0
         )
         *
         GRAVITY;
 
 
+      // Fuerza equivalente en iman
+      forceMagnet_N =
+        forceLoadCell_N *
+        (
+          PIVOT_TO_LOADCELL_M /
+          MAGNET_TO_PIVOT_M
+        );
+
+
       // Torque
       torque_Nm =
-        force_N *
-        TORQUE_ARM_M;
+        forceMagnet_N *
+        MAGNET_TO_PIVOT_M;
     }
 
 
     // ========================================================
-    // SERIAL
+    // MOSTRAR SERIAL
     // ========================================================
 
     Serial.println();
-    Serial.println("======================================================");
 
-    Serial.println("--- VELOCIDAD ---");
-
-
-    Serial.print("RPM filtradas     : ");
-    Serial.println(filteredRPM, 1);
+    Serial.println(
+      "======================================================"
+    );
 
 
-    Serial.print("RPM por conteo    : ");
-    Serial.println(rpmCount, 1);
+    Serial.print(
+      "RPM conteo        : "
+    );
+
+    Serial.println(
+      rpmCount,
+      2
+    );
 
 
-    Serial.print("RPM por periodo   : ");
-    Serial.println(rpmPeriod, 1);
+    Serial.print(
+      "RPM periodo       : "
+    );
+
+    Serial.println(
+      rpmPeriod,
+      2
+    );
 
 
-    Serial.print("RPM FINAL         : ");
-    Serial.println(finalRPM, 1);
+    Serial.print(
+      "RPM filtrada      : "
+    );
+
+    Serial.println(
+      filteredRPM,
+      2
+    );
 
 
-    Serial.print("Diferencia        : ");
-    Serial.print(rpmDifferencePercent, 2);
-    Serial.println(" %");
+    Serial.print(
+      "RPM FINAL         : "
+    );
+
+    Serial.println(
+      finalRPM,
+      2
+    );
 
 
-    Serial.print("Concordancia      : ");
-    Serial.println(rpmAgreement ? "SI" : "NO");
+    Serial.print(
+      "Masa Kalman       : "
+    );
 
+    Serial.print(
+      massFiltered_g,
+      4
+    );
 
-    Serial.println();
-    Serial.println("--- GALGA ---");
-
-
-    Serial.print("RAW               : ");
-    Serial.println(raw, 2);
-
-
-    Serial.print("CeroFinal         : ");
-    Serial.println(zeroRaw, 2);
-
-
-    Serial.print("Masa              : ");
-    Serial.print(mass_g, 2);
     Serial.println(" g");
 
 
-    Serial.print("Fuerza            : ");
-    Serial.print(force_N, 5);
+    Serial.print(
+      "Fuerza galga      : "
+    );
+
+    Serial.print(
+      forceLoadCell_N,
+      6
+    );
+
     Serial.println(" N");
 
 
-    Serial.print("Torque            : ");
-    Serial.print(torque_Nm, 6);
+    Serial.print(
+      "Torque            : "
+    );
+
+    Serial.print(
+      torque_Nm,
+      8
+    );
+
     Serial.println(" N*m");
 
 
-    Serial.println();
-    Serial.println("--- SENAL VELOCIDAD ---");
-
-
-    Serial.print("Frecuencia conteo : ");
-    Serial.print(pulseFrequencyCount, 2);
-    Serial.println(" Hz");
-
-
-    Serial.print("Frecuencia periodo: ");
-    Serial.print(pulseFrequencyPeriod, 2);
-    Serial.println(" Hz");
-
-
-    Serial.print("Transiciones/s    : ");
-    Serial.println(transitionsPerSecond, 2);
-
-
-    Serial.print("Transiciones      : ");
-    Serial.println(edges);
-
-
-    Serial.print("Flancos subida    : ");
-    Serial.println(rises);
-
-
-    Serial.print("Flancos bajada    : ");
-    Serial.println(falls);
-
-
-    Serial.print("Periodo           : ");
-    Serial.print(period);
-    Serial.println(" us");
-
-
-    Serial.print("Duty cycle        : ");
-    Serial.print(duty, 2);
-    Serial.println(" %");
-
-
     // ========================================================
-    // MQTT
+    // CREAR JSON
     // ========================================================
 
     sequence++;
 
 
-    char mensaje[900];
+    char mensaje[1400];
 
 
     snprintf(
@@ -1059,9 +1236,18 @@ void loop()
 
       "\"raw\":%.2f,"
       "\"zero_raw\":%.2f,"
+
+      "\"mass_unfiltered_g\":%.4f,"
       "\"mass_g\":%.4f,"
+      "\"kalman_gain\":%.5f,"
+
       "\"force_N\":%.6f,"
+      "\"force_magnet_N\":%.6f,"
       "\"torque_Nm\":%.8f,"
+
+      "\"magnet_to_pivot_m\":%.3f,"
+      "\"pivot_to_loadcell_m\":%.3f,"
+
       "\"hx_ok\":%s,"
 
       "\"frequency_count_Hz\":%.3f,"
@@ -1081,9 +1267,9 @@ void loop()
       "}",
 
 
-      sequence,
-      nowMs,
-      elapsedMs,
+      (unsigned long)sequence,
+      (unsigned long)nowMs,
+      (unsigned long)elapsedMs,
 
       filteredRPM,
       rpmCount,
@@ -1091,53 +1277,118 @@ void loop()
       finalRPM,
       rpmDifferencePercent,
 
-      rpmAgreement ? "true" : "false",
-      signalActive ? "true" : "false",
+      rpmAgreement
+        ? "true"
+        : "false",
+
+      signalActive
+        ? "true"
+        : "false",
 
       raw,
       zeroRaw,
-      mass_g,
-      force_N,
+
+      massUnfiltered_g,
+      massFiltered_g,
+      kalmanGain,
+
+      forceLoadCell_N,
+      forceMagnet_N,
       torque_Nm,
-      hxOK ? "true" : "false",
+
+      MAGNET_TO_PIVOT_M,
+      PIVOT_TO_LOADCELL_M,
+
+      hxOK
+        ? "true"
+        : "false",
 
       pulseFrequencyCount,
       pulseFrequencyPeriod,
       transitionsPerSecond,
 
-      edges,
-      rises,
-      falls,
+      (unsigned long)edges,
+      (unsigned long)rises,
+      (unsigned long)falls,
 
-      period,
-      highUs,
-      lowUs,
+      (unsigned long)period,
+      (unsigned long)highUs,
+      (unsigned long)lowUs,
 
       duty
     );
 
 
-    bool enviado =
-      mqttClient.publish(
-        MQTT_TOPIC,
-        mensaje
+    // ========================================================
+    // TRANSMITIR POR USB
+    // ========================================================
+
+    if (ENABLE_USB_DATA)
+    {
+      // Python solamente lee las lineas que empiezan DATA:
+      Serial.print("DATA:");
+      Serial.println(mensaje);
+    }
+
+
+    // ========================================================
+    // TRANSMITIR POR MQTT
+    // ========================================================
+
+    bool mqttEnviado = false;
+
+
+    if (
+      ENABLE_MQTT &&
+      mqttClient.connected()
+    )
+    {
+      mqttEnviado =
+        mqttClient.publish(
+          MQTT_TOPIC,
+          mensaje
+        );
+    }
+
+
+    Serial.print(
+      "USB DATA          : "
+    );
+
+    Serial.println(
+      ENABLE_USB_DATA
+        ? "OK"
+        : "DESACTIVADO"
+    );
+
+
+    Serial.print(
+      "MQTT              : "
+    );
+
+
+    if (!ENABLE_MQTT)
+    {
+      Serial.println(
+        "DESACTIVADO"
       );
+    }
 
-
-    Serial.println();
-
-    Serial.print("MQTT              : ");
-
-    if (enviado)
+    else if (mqttEnviado)
     {
       Serial.println("OK");
     }
+
     else
     {
-      Serial.println("ERROR");
+      Serial.println(
+        "SIN CONEXION"
+      );
     }
 
 
-    Serial.println("======================================================");
+    Serial.println(
+      "======================================================"
+    );
   }
 }
