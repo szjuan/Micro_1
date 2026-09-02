@@ -78,7 +78,8 @@ const int ZERO_SAMPLES = 30;
 
 const int HX711_RUN_SAMPLES = 5;
 
-double zeroRaw = 0.0;
+double zeroRaw  = 0.0;
+bool   calibrado = false;   // true solo después de una tara exitosa
 
 
 // ============================================================
@@ -568,11 +569,12 @@ bool realizarTaraAutomatica()
   if (ok)
   {
     resetKalman();
+    calibrado = true;   // habilitar medición en loop()
 
     Serial.print("CeroFinal = ");
     Serial.println(zeroRaw, 2);
 
-    Serial.println("Tara OK.");
+    Serial.println("Tara OK. Iniciando medicion.");
 
     // Notificar al Dashboard que la tara terminó correctamente
     if (mqttClient.connected())
@@ -825,10 +827,11 @@ void setup()
 
 
   // ==========================================================
-  // TARA INICIAL  (automatica; el Dashboard puede re-dispararla)
+  // TARA  —  controlada por el Dashboard (MQTT o Serial 'C')
   // ==========================================================
-
-  realizarTaraAutomatica();
+  // La tara se ejecuta únicamente cuando el Dashboard la solicita,
+  // para garantizar que el montaje esté estabilizado antes de referenciar cero.
+  Serial.println("ESP32 lista. Esperando comando de calibracion desde el Dashboard.");
 
 
   // ==========================================================
@@ -928,8 +931,13 @@ void loop()
 
 
   // ==========================================================
-  // MEDICION CADA 500 ms
+  // MEDICION CADA 500 ms  (solo si ya se realizó la tara)
   // ==========================================================
+
+  if (!calibrado)
+  {
+    return;   // esperar calibración — WiFi y MQTT siguen activos
+  }
 
   if (
     millis() - previousReportMs
