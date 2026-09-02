@@ -573,6 +573,16 @@ bool realizarTaraAutomatica()
     Serial.println(zeroRaw, 2);
 
     Serial.println("Tara OK.");
+
+    // Notificar al Dashboard que la tara terminó correctamente
+    if (mqttClient.connected())
+    {
+      mqttClient.publish(
+        MQTT_TOPIC,
+        "{\"status\":\"tara_ok\"}"
+      );
+      Serial.println("MQTT: tara_ok publicado.");
+    }
   }
 
   else
@@ -580,6 +590,15 @@ bool realizarTaraAutomatica()
     Serial.println(
       "ERROR: HX711 no respondio."
     );
+
+    // Notificar al Dashboard que la tara falló
+    if (mqttClient.connected())
+    {
+      mqttClient.publish(
+        MQTT_TOPIC,
+        "{\"status\":\"tara_error\"}"
+      );
+    }
   }
 
   Serial.println();

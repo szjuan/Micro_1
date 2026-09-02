@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFrame, QStackedWidget,
     QScrollArea, QFileDialog, QMessageBox,
-    QSizePolicy,
+    QSizePolicy, QDoubleSpinBox,
 )
 import pyqtgraph as pg
 
@@ -57,7 +57,7 @@ SERIAL_BAUD = 115200
 # ============================================================
 #  FUENTE PROGRAMABLE KEYSIGHT  —  PyVISA  (Canal 1)
 # ============================================================
-VISA_ADDRESS    = "USB0::0x2A8D::0x3302::MY61004637::0::INSTR"
+VISA_ADDRESS    = "USB0::0x2A8D::0x3302::MY61004672::0::INSTR"
 FUENTE_INTERVAL = 0.5   # segundos entre lecturas
 
 # ============================================================
@@ -97,7 +97,14 @@ _ultimo_torque_v = 0.0
 _inicio_tiempo = time.time()
 
 # Valores actuales de la fuente (actualizados por hilo PyVISA)
-_V_fuente = 0.0
+_V_fuente    = 0.0
+_fuente_inst = None   # handle pyvisa.Resource compartido con controles GUI
+
+# Prueba de escalones de voltaje
+_escalon_stop = threading.Event()   # set() para detener la secuencia
+
+# Confirmación de tara desde ESP32
+_tara_ok_event = threading.Event()  # set() cuando llega {"status":"tara_ok"}
 _I_fuente = 0.0
 
 # Tipo de prueba activa ("prueba1" | "prueba2")
@@ -115,6 +122,7 @@ class _Señales(QObject):
     conexion_msg     = pyqtSignal(str)
     datos_nuevos     = pyqtSignal()
     punto_capturado  = pyqtSignal(int)   # emite el número de punto
+    escalon_progreso = pyqtSignal(str)   # texto de estado del escalón
 
 
 señales = _Señales()
@@ -206,10 +214,9 @@ def _procesar(data: dict):
 def _leer_fuente_loop():
     """
     Lee V e I del canal 1 de la fuente Keysight en loop.
-    Usa el mismo protocolo del código de prueba del usuario:
-      INST:SEL CH1 → MEAS:VOLT? → MEAS:CURR?
+    Guarda el handle en _fuente_inst para que la GUI pueda enviar comandos.
     """
-    global _V_fuente, _I_fuente
+    global _V_fuente, _I_fuente, _fuente_inst
     try:
         import pyvisa  # type: ignore
         rm   = pyvisa.ResourceManager()
@@ -218,8 +225,12 @@ def _leer_fuente_loop():
         inst.write_termination = "\n"
         inst.read_termination  = "\n"
 
-        # Seleccionar canal 1 una sola vez al conectar
+        # Seleccionar CH1, fijar voltaje a 0 y encender salida
         inst.write("INST:SEL CH1")
+        inst.write("VOLT 0")
+        inst.write("OUTP ON")
+
+        _fuente_inst = inst   # exponer handle para controles GUI
 
         señales.conexion_msg.emit(
             f"Fuente Keysight conectada · {inst.query('*IDN?').strip()[:40]}"
@@ -237,6 +248,74 @@ def _leer_fuente_loop():
         señales.conexion_msg.emit(f"PyVISA: {e} (sin fuente, V=0 I=0)")
 
 
+def _set_voltaje(v: float):
+    """Envía VOLT <v> al CH1. Seguro para llamar desde la GUI."""
+    if _fuente_inst is None:
+        return
+    try:
+        _fuente_inst.write(f"VOLT {v:.3f}")
+    except Exception:
+        pass
+
+
+def _set_output(on: bool):
+    """Enciende o apaga la salida CH1."""
+    if _fuente_inst is None:
+        return
+    try:
+        _fuente_inst.write("OUTP ON" if on else "OUTP OFF")
+    except Exception:
+        pass
+
+
+def _run_escalones(v_ini: float, v_fin: float, paso: float, duracion: float):
+    """
+    Hilo background para prueba de escalones de voltaje.
+    Recorre de v_ini a v_fin en pasos de 'paso' voltios,
+    manteniendo cada escalón 'duracion' segundos.
+    Captura un punto estable al final de cada escalón.
+    """
+    _escalon_stop.clear()
+
+    import math as _math
+    n_pasos = max(1, round((_math.fabs(v_fin - v_ini)) / paso) + 1)
+    signo   = 1.0 if v_fin >= v_ini else -1.0
+    voltajes = [round(v_ini + signo * paso * i, 3) for i in range(n_pasos)]
+    # Asegurar que el último valor sea exactamente v_fin
+    voltajes[-1] = v_fin
+
+    total = len(voltajes)
+    for idx, v in enumerate(voltajes, start=1):
+        if _escalon_stop.is_set():
+            señales.escalon_progreso.emit("Detenido por el usuario")
+            _set_voltaje(0.0)
+            return
+
+        _set_voltaje(v)
+        señales.escalon_progreso.emit(
+            f"Escalón {idx}/{total} · {v:.1f} V"
+        )
+
+        # Esperar duracion segundos o hasta que se detenga, con cuenta regresiva
+        t_fin = time.time() + duracion
+        while time.time() < t_fin:
+            if _escalon_stop.is_set():
+                señales.escalon_progreso.emit("Detenido por el usuario")
+                _set_voltaje(0.0)
+                return
+            restante = int(t_fin - time.time()) + 1
+            señales.escalon_progreso.emit(
+                f"Escalón {idx}/{total} · {v:.1f} V · {restante}s"
+            )
+            time.sleep(0.5)
+
+        # Capturar punto al final del escalón
+        _capturar_punto_estable()
+
+    _set_voltaje(0.0)
+    señales.escalon_progreso.emit(f"Completado · {total} escalones")
+
+
 # ============================================================
 #  MQTT
 # ============================================================
@@ -250,7 +329,16 @@ def _on_connect(client, userdata, flags, rc, props):
 
 def _on_message(client, userdata, msg):
     try:
-        _procesar(json.loads(msg.payload.decode("utf-8")))
+        data = json.loads(msg.payload.decode("utf-8"))
+        status = data.get("status", "")
+        if status == "tara_ok":
+            _tara_ok_event.set()
+            señales.conexion_msg.emit("ESP32: tara confirmada ✓")
+            return
+        if status == "tara_error":
+            señales.conexion_msg.emit("ESP32: ERROR en tara — HX711 sin respuesta")
+            return
+        _procesar(data)
     except Exception:
         pass
 
@@ -643,25 +731,64 @@ class _PantallaConfig(QWidget):
 
     def _cal_mqtt(self):
         global _inicio_tiempo
+
+        # 1. Arrancar el cliente MQTT
         threading.Thread(target=_iniciar_mqtt_loop, daemon=True).start()
+
+        # 2. Esperar conexión al broker (máx 20 s)
         deadline = time.time() + 20
         while time.time() < deadline:
             if _mqtt_client and _mqtt_client.is_connected():
                 break
             time.sleep(0.4)
+
+        if not (_mqtt_client and _mqtt_client.is_connected()):
+            señales.conexion_msg.emit("Error: no se pudo conectar al broker MQTT")
+            QTimer.singleShot(0, self._cal_timeout)
+            return
+
+        # 3. Enviar comando de calibración
+        _tara_ok_event.clear()
         _inicio_tiempo = time.time()
         _publicar_cmd("calibrate")
-        señales.conexion_msg.emit("Calibración enviada por MQTT")
-        QTimer.singleShot(0, self._cal_ok)
+        señales.conexion_msg.emit("Calibración enviada — esperando ESP32…")
+
+        # 4. Esperar confirmación tara_ok de la ESP32 (máx 30 s)
+        for i in range(30):
+            if _tara_ok_event.wait(timeout=1.0):
+                # ESP32 confirmó tara exitosa
+                QTimer.singleShot(0, self._cal_ok)
+                return
+            restante = 30 - i - 1
+            señales.conexion_msg.emit(
+                f"Calibrando galga… {restante}s"
+            )
+
+        # Timeout: la ESP32 no respondió
+        señales.conexion_msg.emit(
+            "Timeout: ESP32 no confirmó la tara — verifica la conexión"
+        )
+        QTimer.singleShot(0, self._cal_timeout)
 
     def _cal_ok(self):
         self._btn_cal.setText("✓   Sistema Calibrado")
+        self._btn_cal.setEnabled(False)
         self._lbl_estado.setStyleSheet("font-size:12px; color:#7EE787;")
         self._lbl_estado.setText("Sistema listo para medir.")
         self._btn_go.setEnabled(True)
 
         # Iniciar hilo de lectura de fuente Keysight (no bloqueante si no está disponible)
         threading.Thread(target=_leer_fuente_loop, daemon=True).start()
+
+    def _cal_timeout(self):
+        """La ESP32 no confirmó la tara en el tiempo esperado."""
+        self._btn_cal.setText("⚠  Reintentar Calibración")
+        self._btn_cal.setEnabled(True)
+        self._lbl_estado.setStyleSheet("font-size:12px; color:#FF7B72;")
+        self._lbl_estado.setText(
+            "Sin respuesta de la ESP32.\n"
+            "Verifica WiFi y conexión MQTT, luego reintenta."
+        )
 
 
 # ============================================================
@@ -834,6 +961,7 @@ class _PantallaGraficas(QWidget):
         señales.punto_capturado.connect(
             lambda n: self._lbl_puntos.setText(f"Puntos capturados: {n}")
         )
+        señales.escalon_progreso.connect(self._on_escalon_progreso)
 
     def _hacer_panel_vars(self) -> QFrame:
         panel = QFrame(); panel.setObjectName("panel_vars")
@@ -875,6 +1003,149 @@ class _PantallaGraficas(QWidget):
             row.addWidget(l_val); row.addWidget(l_uni)
             v.addLayout(row)
             self._lbl_vars[sym] = l_val
+
+        v.addWidget(_sep())
+
+        # ── Control Fuente Keysight ─────────────────────────────
+        lbl_fuente = QLabel("Control Fuente · CH1")
+        lbl_fuente.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_YELLOW};")
+        v.addWidget(lbl_fuente)
+
+        # Fila: spinbox voltaje + botón Aplicar
+        row_v = QHBoxLayout(); row_v.setSpacing(6)
+        self._spin_volt = QDoubleSpinBox()
+        self._spin_volt.setRange(0.0, 30.0)
+        self._spin_volt.setSingleStep(0.5)
+        self._spin_volt.setDecimals(1)
+        self._spin_volt.setSuffix(" V")
+        self._spin_volt.setValue(0.0)
+        self._spin_volt.setFixedHeight(32)
+        self._spin_volt.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background:#21262D; color:{_PRI};
+                border:1px solid {_BORDER}; border-radius:5px;
+                font-size:13px; padding:2px 6px;
+            }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                width:18px; background:#30363D; border:none;
+            }}
+        """)
+        btn_aplicar = QPushButton("Aplicar")
+        btn_aplicar.setFixedHeight(32)
+        btn_aplicar.setStyleSheet(f"""
+            QPushButton {{
+                background-color:{_YELLOW}; color:#0D1117;
+                border:none; border-radius:5px;
+                font-size:11px; font-weight:bold;
+            }}
+            QPushButton:hover {{ background-color:#E3C000; }}
+        """)
+        btn_aplicar.clicked.connect(
+            lambda: _set_voltaje(self._spin_volt.value())
+        )
+        row_v.addWidget(self._spin_volt, stretch=1)
+        row_v.addWidget(btn_aplicar)
+        v.addLayout(row_v)
+
+        # Botón ON/OFF salida
+        self._btn_outp = QPushButton("⚡  Salida ON")
+        self._btn_outp.setCheckable(True)
+        self._btn_outp.setChecked(True)
+        self._btn_outp.setFixedHeight(32)
+        self._btn_outp_style_on  = f"""
+            QPushButton {{
+                background-color:#1A4D2E; color:#39D353;
+                border:1px solid #39D353; border-radius:5px;
+                font-size:11px; font-weight:bold;
+            }}
+            QPushButton:hover {{ background-color:#245C38; }}
+        """
+        self._btn_outp_style_off = f"""
+            QPushButton {{
+                background-color:#3D1515; color:#FF7B72;
+                border:1px solid #FF7B72; border-radius:5px;
+                font-size:11px; font-weight:bold;
+            }}
+            QPushButton:hover {{ background-color:#5C1F1F; }}
+        """
+        self._btn_outp.setStyleSheet(self._btn_outp_style_on)
+        self._btn_outp.toggled.connect(self._toggle_output)
+        v.addWidget(self._btn_outp)
+
+        v.addWidget(_sep())
+
+        # ── Prueba de Escalones de Voltaje ─────────────────────
+        lbl_esc = QLabel("Prueba de Escalones")
+        lbl_esc.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_CYAN};")
+        v.addWidget(lbl_esc)
+
+        def _spin_esc(lo, hi, val, step, dec, suf):
+            s = QDoubleSpinBox()
+            s.setRange(lo, hi); s.setValue(val)
+            s.setSingleStep(step); s.setDecimals(dec)
+            s.setSuffix(suf); s.setFixedHeight(28)
+            s.setStyleSheet(f"""
+                QDoubleSpinBox {{
+                    background:#21262D; color:{_PRI};
+                    border:1px solid {_BORDER}; border-radius:4px;
+                    font-size:12px; padding:1px 4px;
+                }}
+                QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                    width:16px; background:#30363D; border:none;
+                }}
+            """)
+            return s
+
+        def _row_param(label, widget):
+            r = QHBoxLayout(); r.setSpacing(4)
+            l = QLabel(label)
+            l.setStyleSheet(f"font-size:10px; color:{_SEC};")
+            l.setFixedWidth(58)
+            r.addWidget(l); r.addWidget(widget)
+            return r
+
+        self._spin_v_ini  = _spin_esc(0.0, 30.0, 6.0,  0.5, 1, " V")
+        self._spin_v_fin  = _spin_esc(0.0, 30.0, 24.0, 0.5, 1, " V")
+        self._spin_paso   = _spin_esc(0.5, 10.0, 2.0,  0.5, 1, " V")
+        self._spin_dur    = _spin_esc(5.0, 300.0, 15.0, 5.0, 0, " s")
+
+        v.addLayout(_row_param("V inicio:", self._spin_v_ini))
+        v.addLayout(_row_param("V final:",  self._spin_v_fin))
+        v.addLayout(_row_param("Paso V:",   self._spin_paso))
+        v.addLayout(_row_param("Duración:", self._spin_dur))
+
+        # Botón Iniciar / Detener
+        self._btn_esc = QPushButton("▶  Iniciar Escalones")
+        self._btn_esc.setCheckable(True)
+        self._btn_esc.setFixedHeight(34)
+        self._btn_esc_style_ini = f"""
+            QPushButton {{
+                background-color:#0D419D; color:white;
+                border:none; border-radius:5px;
+                font-size:11px; font-weight:bold;
+            }}
+            QPushButton:hover {{ background-color:#1158C7; }}
+        """
+        self._btn_esc_style_det = f"""
+            QPushButton {{
+                background-color:#3D1515; color:#FF7B72;
+                border:1px solid #FF7B72; border-radius:5px;
+                font-size:11px; font-weight:bold;
+            }}
+            QPushButton:hover {{ background-color:#5C1F1F; }}
+        """
+        self._btn_esc.setStyleSheet(self._btn_esc_style_ini)
+        self._btn_esc.toggled.connect(self._toggle_escalones)
+        v.addWidget(self._btn_esc)
+
+        # Label de estado del escalón
+        self._lbl_esc_estado = QLabel("Sin iniciar")
+        self._lbl_esc_estado.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_esc_estado.setWordWrap(True)
+        self._lbl_esc_estado.setStyleSheet(
+            f"font-size:10px; color:{_SEC}; padding:2px;"
+        )
+        v.addWidget(self._lbl_esc_estado)
 
         v.addWidget(_sep())
 
@@ -1017,6 +1288,43 @@ class _PantallaGraficas(QWidget):
             lbl.setText(vals.get(sym, "—"))
 
     # ── exportación ───────────────────────────────────────────
+    def _toggle_output(self, checked: bool):
+        """Enciende/apaga salida CH1 y actualiza estilo del botón."""
+        _set_output(checked)
+        if checked:
+            self._btn_outp.setText("⚡  Salida ON")
+            self._btn_outp.setStyleSheet(self._btn_outp_style_on)
+        else:
+            self._btn_outp.setText("○  Salida OFF")
+            self._btn_outp.setStyleSheet(self._btn_outp_style_off)
+
+    def _toggle_escalones(self, checked: bool):
+        if checked:
+            self._btn_esc.setText("⏹  Detener")
+            self._btn_esc.setStyleSheet(self._btn_esc_style_det)
+            threading.Thread(
+                target=_run_escalones,
+                args=(
+                    self._spin_v_ini.value(),
+                    self._spin_v_fin.value(),
+                    self._spin_paso.value(),
+                    self._spin_dur.value(),
+                ),
+                daemon=True,
+            ).start()
+        else:
+            _escalon_stop.set()
+            self._btn_esc.setText("▶  Iniciar Escalones")
+            self._btn_esc.setStyleSheet(self._btn_esc_style_ini)
+
+    def _on_escalon_progreso(self, texto: str):
+        self._lbl_esc_estado.setText(texto)
+        # Cuando termina, restablecer botón
+        if texto.startswith("Completado") or texto.startswith("Detenido"):
+            self._btn_esc.setChecked(False)
+            self._btn_esc.setText("▶  Iniciar Escalones")
+            self._btn_esc.setStyleSheet(self._btn_esc_style_ini)
+
     def _exportar(self):
         directorio = QFileDialog.getExistingDirectory(
             self, "Seleccionar carpeta de destino"
