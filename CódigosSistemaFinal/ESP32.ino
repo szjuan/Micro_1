@@ -25,7 +25,7 @@ const bool ENABLE_MQTT     = true;
 // WIFI
 // ============================================================
 
-const char* WIFI_SSID     = "Iphone de Andrés Felipe";
+const char* WIFI_SSID     = "iphone de Andrés Felipe";
 const char* WIFI_PASSWORD = "12345678";
 
 
