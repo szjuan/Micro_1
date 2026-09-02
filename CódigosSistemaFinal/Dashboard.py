@@ -44,8 +44,8 @@ import pyqtgraph as pg
 # ============================================================
 MQTT_BROKER     = "0e44beba4fc7422cb74bc8bbdcc67b2f.s1.eu.hivemq.cloud"
 MQTT_PORT       = 8883
-MQTT_USER       = "EspMicroUno"
-MQTT_PASSWORD   = "FrenoMotor2026!"
+MQTT_USER       = "ESPMICROUNO"
+MQTT_PASSWORD   = "espmicrouno"
 TOPIC_TELEMETRY = "micro1/motor1/telemetry"
 TOPIC_CMD       = "micro1/motor1/cmd"
 
@@ -262,8 +262,9 @@ def _iniciar_mqtt_loop():
         client_id="Dashboard_FrenoMotorDC",
     )
     c.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-    c.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
-    c.tls_insecure_set(True)
+    # HiveMQ Cloud tiene certificado CA válido; se usa el trust store del sistema.
+    c.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS)
+    c.tls_insecure_set(False)
     c.on_connect = _on_connect
     c.on_message = _on_message
     _mqtt_client = c
