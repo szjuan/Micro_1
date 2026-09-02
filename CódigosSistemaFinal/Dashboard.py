@@ -715,17 +715,40 @@ class _PantallaConfig(QWidget):
             ser = serial.Serial(puerto, SERIAL_BAUD, timeout=0.5)
             _serial_port = ser
             señales.conexion_msg.emit(f"Puerto USB: {puerto}")
+
+            # Pequeña pausa para que la ESP32 termine de arrancar
             time.sleep(2.0)
-            deadline = time.time() + 20; enviado = False
+
+            # Enviar comando de calibración
+            ser.write(b"C\n")
+            señales.conexion_msg.emit("Calibración enviada — esperando ESP32…")
+            _inicio_tiempo = time.time()
+
+            # Esperar confirmación "Tara OK" en el serial (máx 30 s)
+            deadline = time.time() + 30
+            confirmado = False
             while time.time() < deadline:
                 linea = ser.readline().decode("utf-8", errors="ignore").strip()
-                if "1 = Tara automatica" in linea:
-                    ser.write(b"1\n"); enviado = True; break
-            if not enviado:
-                ser.write(b"1\n")
-            _inicio_tiempo = time.time()
-            QTimer.singleShot(0, self._cal_ok)
+                restante = int(deadline - time.time()) + 1
+                if linea:
+                    señales.conexion_msg.emit(f"ESP32: {linea}")
+                if "Tara OK" in linea:
+                    confirmado = True
+                    break
+                señales.conexion_msg.emit(f"Calibrando galga… {restante}s")
+
+            if confirmado:
+                QTimer.singleShot(0, self._cal_ok)
+            else:
+                señales.conexion_msg.emit(
+                    "Timeout: ESP32 no confirmó la tara — verifica conexión USB"
+                )
+                QTimer.singleShot(0, self._cal_timeout)
+                return
+
+            # Continuar leyendo datos de telemetría en este mismo hilo
             _leer_serial_loop(ser)
+
         except Exception as e:
             señales.conexion_msg.emit(f"Error serial: {e}")
 
