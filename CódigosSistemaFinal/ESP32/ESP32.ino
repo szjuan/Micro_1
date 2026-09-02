@@ -35,8 +35,8 @@ const char* WIFI_PASSWORD = "12345678";
 //
 const char* MQTT_SERVER   = "0e44beba4fc7422cb74bc8bbdcc67b2f.s1.eu.hivemq.cloud";
 const int   MQTT_PORT     = 8883;
-const char* MQTT_USER     = "EspMicroUno";
-const char* MQTT_PASSWORD = "FrenoMotor2026!";
+const char* MQTT_USER     = "ESPMICROUNO";
+const char* MQTT_PASSWORD = "espmicrouno";
 
 const char* MQTT_TOPIC     = "micro1/motor1/telemetry";
 const char* MQTT_TOPIC_CMD = "micro1/motor1/cmd";
