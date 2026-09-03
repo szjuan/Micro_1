@@ -1,25 +1,35 @@
 """
 Steady-state characteristic curves for the 57BLDC75-20730-08B21.
 
-Casos incluidos:
+CASO 1:
+    Características del motor a 24 V frente al torque de carga.
 
-1. Características del motor a 24 V frente al torque de carga.
-2. Barrido de voltaje desde 6 V hasta 24 V.
-3. Para el barrido 6-24 V:
-       - Corriente máxima permitida = 1 A.
-       - El voltaje aumenta a razón de 1 V cada 10 segundos.
-       - 6 V  ->   0 s
-       - 7 V  ->  10 s
-       - 8 V  ->  20 s
-       - ...
-       - 24 V -> 180 s
+CASO 2:
+    Barrido escalonado de voltaje:
 
-Además se generan:
+        0 - 10 s      -> 6 V
+        10 - 20 s     -> 7 V
+        20 - 30 s     -> 8 V
+        30 - 40 s     -> 9 V
+        ...
+        170 - 180 s   -> 23 V
+        180 s         -> 24 V
+
+    El ensayo EMPIEZA directamente en 6 V.
+    NO existe un escalón inicial en 0 V.
+
+    El voltaje aumenta 1 V cada 10 segundos.
+
+    Corriente máxima para este ensayo = 1 A.
+
+CSV generados:
 
     tiempo_vs_rpm.csv
+
         t_s,Rpm
 
     tiempo_vs_voltaje.csv
+
         t_s,Voltaje
 """
 
@@ -48,17 +58,18 @@ class Motor:
 
     nominal_voltage: float = 24.0         # V
 
-    # Límite utilizado para las curvas de torque
-    current_limit: float = 0.9            # A
+    # Límite utilizado para las curvas de torque.
+    current_limit: float = 0.9             # A
 
-    # Límite específico para el ensayo de 6 V a 24 V
-    voltage_sweep_current_limit: float = 1.0  # A
+    # Límite específico del ensayo escalonado 6 -> 24 V.
+    voltage_sweep_current_limit: float = 1.0   # A
 
     @property
     def back_emf_constant(self) -> float:
         """
         Back-EMF constant in V/(rad/s).
         """
+
         return self.back_emf_v_per_krpm / (
             1000.0 * 2.0 * np.pi / 60.0
         )
@@ -86,7 +97,8 @@ class Motor:
 
 
 # ============================================================================
-# TORQUE CHARACTERISTICS AT 24 V
+# CASO 1
+# CARACTERÍSTICAS DEL MOTOR VS TORQUE A 24 V
 # ============================================================================
 
 def torque_characteristics(
@@ -103,7 +115,7 @@ def torque_characteristics(
     imax = motor.current_limit
 
     # ------------------------------------------------------------------------
-    # CURRENT LIMIT TRANSITION
+    # PUNTO DONDE COMIENZA EL LÍMITE DE CORRIENTE
     # ------------------------------------------------------------------------
 
     omega_limit = (
@@ -133,7 +145,7 @@ def torque_characteristics(
     )
 
     # ------------------------------------------------------------------------
-    # STALL
+    # TORQUE DE BLOQUEO
     # ------------------------------------------------------------------------
 
     stall_torque = (
@@ -141,7 +153,7 @@ def torque_characteristics(
     )
 
     # ------------------------------------------------------------------------
-    # TORQUE VECTOR
+    # VECTOR DE TORQUE
     # ------------------------------------------------------------------------
 
     load_torque = np.arange(
@@ -155,6 +167,7 @@ def torque_characteristics(
     ]
 
     if load_torque[-1] < stall_torque:
+
         load_torque = np.append(
             load_torque,
             stall_torque
@@ -163,7 +176,9 @@ def torque_characteristics(
     n = len(load_torque)
 
     current = np.zeros(n)
+
     omega = np.zeros(n)
+
     effective_voltage = np.zeros(n)
 
     current_limited = np.zeros(
@@ -172,10 +187,12 @@ def torque_characteristics(
     )
 
     # ------------------------------------------------------------------------
-    # OPERATING POINTS
+    # PUNTOS DE OPERACIÓN
     # ------------------------------------------------------------------------
 
     for k, torque in enumerate(load_torque):
+
+        # Punto sin límite de corriente.
 
         omega_unlimited = (
             voltage_command
@@ -196,17 +213,19 @@ def torque_characteristics(
         ) / kt
 
         # --------------------------------------------------------------------
-        # NORMAL REGION
+        # REGIÓN NORMAL
         # --------------------------------------------------------------------
 
         if current_unlimited <= imax:
 
             current[k] = current_unlimited
+
             omega[k] = omega_unlimited
+
             effective_voltage[k] = voltage_command
 
         # --------------------------------------------------------------------
-        # CURRENT LIMITED REGION
+        # REGIÓN LIMITADA POR CORRIENTE
         # --------------------------------------------------------------------
 
         else:
@@ -237,7 +256,7 @@ def torque_characteristics(
             )
 
     # ------------------------------------------------------------------------
-    # OUTPUT VARIABLES
+    # RPM
     # ------------------------------------------------------------------------
 
     rpm = (
@@ -245,6 +264,10 @@ def torque_characteristics(
         * 60.0
         / (2.0 * np.pi)
     )
+
+    # ------------------------------------------------------------------------
+    # POTENCIA
+    # ------------------------------------------------------------------------
 
     mechanical_power = (
         load_torque
@@ -255,6 +278,10 @@ def torque_characteristics(
         effective_voltage
         * current
     )
+
+    # ------------------------------------------------------------------------
+    # EFICIENCIA
+    # ------------------------------------------------------------------------
 
     efficiency = np.divide(
         100.0 * mechanical_power,
@@ -268,21 +295,29 @@ def torque_characteristics(
 
     return {
 
-        "load_torque_Nm": load_torque,
+        "load_torque_Nm":
+            load_torque,
 
-        "current_A": current,
+        "current_A":
+            current,
 
-        "speed_RPM": rpm,
+        "speed_RPM":
+            rpm,
 
-        "effective_voltage_V": effective_voltage,
+        "effective_voltage_V":
+            effective_voltage,
 
-        "mechanical_power_W": mechanical_power,
+        "mechanical_power_W":
+            mechanical_power,
 
-        "electrical_power_W": electrical_power,
+        "electrical_power_W":
+            electrical_power,
 
-        "efficiency_percent": efficiency,
+        "efficiency_percent":
+            efficiency,
 
-        "current_limited": current_limited,
+        "current_limited":
+            current_limited,
 
         "current_limit_torque_Nm":
             current_limit_torque,
@@ -299,122 +334,242 @@ def torque_characteristics(
 
 
 # ============================================================================
-# VOLTAGE SWEEP
-# 6 V -> 24 V
-# 1 V every 10 seconds
-# Maximum current = 1 A
+# CASO 2
+#
+# BARRIDO ESCALONADO:
+#
+# 0 - 10 s      -> 6 V
+# 10 - 20 s     -> 7 V
+# 20 - 30 s     -> 8 V
+# 30 - 40 s     -> 9 V
+# ...
+# 170 - 180 s   -> 23 V
+# 180 s         -> 24 V
+#
+# Imax = 1 A
+#
 # ============================================================================
 
 def voltage_speed_characteristic(
     motor: Motor,
     minimum_voltage: float = 6.0,
-    samples: int = 500,
-    seconds_per_volt: float = 10.0,
+    maximum_voltage: float = 24.0,
+    voltage_step: float = 1.0,
+    seconds_per_step: float = 10.0,
 ) -> dict[str, np.ndarray]:
 
-    maximum_voltage = motor.nominal_voltage
-
     # ------------------------------------------------------------------------
-    # VOLTAGE VECTOR
+    # NIVELES DE VOLTAJE
+    #
+    # 6, 7, 8, 9, ..., 24 V
+    #
+    # IMPORTANTE:
+    # NO se agrega 0 V al inicio.
     # ------------------------------------------------------------------------
 
-    voltage = np.linspace(
+    voltage_levels = np.arange(
         minimum_voltage,
-        maximum_voltage,
-        samples,
+        maximum_voltage + voltage_step,
+        voltage_step,
     )
 
     # ------------------------------------------------------------------------
-    # TIME VECTOR
+    # CONSTRUCCIÓN DE ESCALONES
     #
-    # 1 V = 10 seconds
+    # El vector queda de esta forma:
     #
-    # t = (V - 6) * 10
+    # t_s    Voltaje
     #
-    # 6 V  ->   0 s
-    # 7 V  ->  10 s
+    # 0      6
+    # 10     6
+    # 10     7
+    # 20     7
+    # 20     8
+    # 30     8
+    # 30     9
     # ...
-    # 24 V -> 180 s
+    # 170    23
+    # 180    23
+    # 180    24
+    #
+    # Repetir el mismo tiempo en la transición genera
+    # una línea vertical cuando se grafica.
     # ------------------------------------------------------------------------
 
-    time_s = (
-        voltage
-        - minimum_voltage
-    ) * seconds_per_volt
+    time_points = []
+    voltage_points = []
+
+    for k in range(len(voltage_levels) - 1):
+
+        voltage_actual = voltage_levels[k]
+
+        tiempo_inicio = (
+            k * seconds_per_step
+        )
+
+        tiempo_final = (
+            (k + 1)
+            * seconds_per_step
+        )
+
+        # Inicio del escalón.
+        time_points.append(
+            tiempo_inicio
+        )
+
+        voltage_points.append(
+            voltage_actual
+        )
+
+        # Fin del escalón.
+        time_points.append(
+            tiempo_final
+        )
+
+        voltage_points.append(
+            voltage_actual
+        )
 
     # ------------------------------------------------------------------------
-    # MOTOR EQUATIONS
+    # ÚLTIMO PUNTO
+    #
+    # A los 180 segundos:
+    #
+    # 23 V -> 24 V
     # ------------------------------------------------------------------------
 
-    denominator = (
-        motor.back_emf_constant
-        + motor.resistance
-        * motor.viscous_friction
-        / motor.torque_constant
+    final_time = (
+        (len(voltage_levels) - 1)
+        * seconds_per_step
     )
 
-    omega = (
-        voltage
-        / denominator
+    time_points.append(
+        final_time
     )
 
-    current = (
-        motor.viscous_friction
-        * omega
-        / motor.torque_constant
+    voltage_points.append(
+        voltage_levels[-1]
     )
 
     # ------------------------------------------------------------------------
-    # 1 A MAXIMUM CURRENT LIMIT
+    # CONVERTIR A NUMPY
     # ------------------------------------------------------------------------
 
-    current_limit = (
+    time_s = np.array(
+        time_points,
+        dtype=float
+    )
+
+    voltage = np.array(
+        voltage_points,
+        dtype=float
+    )
+
+    # ------------------------------------------------------------------------
+    # PARÁMETROS DEL MOTOR
+    # ------------------------------------------------------------------------
+
+    r = motor.resistance
+    kt = motor.torque_constant
+    ke = motor.back_emf_constant
+    b = motor.viscous_friction
+
+    # Corriente máxima de este ensayo.
+    imax = (
         motor.voltage_sweep_current_limit
     )
 
-    current_limited = (
-        current > current_limit
+    # ------------------------------------------------------------------------
+    # ARRAYS DE RESULTADOS
+    # ------------------------------------------------------------------------
+
+    omega = np.zeros_like(
+        voltage
     )
 
-    # If the theoretical point exceeds 1 A,
-    # current is limited to exactly 1 A.
+    current = np.zeros_like(
+        voltage
+    )
 
-    for k in range(len(voltage)):
+    current_limited = np.zeros(
+        len(voltage),
+        dtype=bool
+    )
 
-        if current[k] > current_limit:
+    # ------------------------------------------------------------------------
+    # MODELO EN ESTADO ESTACIONARIO
+    # ------------------------------------------------------------------------
 
-            current[k] = current_limit
+    denominator = (
+        ke
+        + r * b / kt
+    )
 
-            # Mechanical equilibrium at zero external load:
-            #
-            # Kt*i = B*omega
+    # ------------------------------------------------------------------------
+    # CALCULAR RPM PARA CADA ESCALÓN
+    # ------------------------------------------------------------------------
 
-            omega_from_current_limit = (
-                motor.torque_constant
-                * current_limit
-                / motor.viscous_friction
+    for k, v in enumerate(voltage):
+
+        # --------------------------------------------------------------------
+        # PUNTO SIN LÍMITE DE CORRIENTE
+        # --------------------------------------------------------------------
+
+        omega_unlimited = (
+            v / denominator
+        )
+
+        current_unlimited = (
+            b
+            * omega_unlimited
+            / kt
+        )
+
+        # --------------------------------------------------------------------
+        # REGIÓN NORMAL
+        # --------------------------------------------------------------------
+
+        if current_unlimited <= imax:
+
+            omega[k] = omega_unlimited
+
+            current[k] = current_unlimited
+
+        # --------------------------------------------------------------------
+        # REGIÓN LIMITADA A 1 A
+        # --------------------------------------------------------------------
+
+        else:
+
+            current_limited[k] = True
+
+            current[k] = imax
+
+            # Límite mecánico debido a Imax.
+            omega_mechanical_limit = (
+                kt
+                * imax
+                / b
             )
 
-            # Electrical equilibrium:
-            #
-            # omega = (V - R*i)/Ke
+            # Límite eléctrico debido al voltaje disponible.
+            omega_electrical_limit = (
+                v
+                - r * imax
+            ) / ke
 
-            omega_from_voltage = (
-                voltage[k]
-                - motor.resistance
-                * current_limit
-            ) / motor.back_emf_constant
+            omega_electrical_limit = max(
+                omega_electrical_limit,
+                0.0
+            )
 
-            omega[k] = max(
-                0.0,
-                min(
-                    omega_from_current_limit,
-                    omega_from_voltage
-                )
+            omega[k] = min(
+                omega_mechanical_limit,
+                omega_electrical_limit
             )
 
     # ------------------------------------------------------------------------
-    # RPM
+    # CONVERTIR RAD/S -> RPM
     # ------------------------------------------------------------------------
 
     speed_rpm = (
@@ -425,20 +580,25 @@ def voltage_speed_characteristic(
 
     return {
 
-        "time_s": time_s,
+        "time_s":
+            time_s,
 
-        "voltage_V": voltage,
+        "voltage_V":
+            voltage,
 
-        "speed_RPM": speed_rpm,
+        "speed_RPM":
+            speed_rpm,
 
-        "current_A": current,
+        "current_A":
+            current,
 
-        "current_limited": current_limited,
+        "current_limited":
+            current_limited,
     }
 
 
 # ============================================================================
-# GENERAL CSV
+# GUARDAR CSV GENERAL
 # ============================================================================
 
 def save_csv(
@@ -459,9 +619,6 @@ def save_csv(
 
         and value.ndim == 1
     }
-
-    # Only arrays having the same length
-    # as the first array are saved.
 
     if not arrays:
         return
@@ -499,7 +656,9 @@ def save_csv(
 
 
 # ============================================================================
-# SAVE TIME VS RPM
+# CSV SOLICITADO 1
+#
+# t_s,Rpm
 # ============================================================================
 
 def save_time_vs_rpm_csv(
@@ -525,7 +684,9 @@ def save_time_vs_rpm_csv(
 
 
 # ============================================================================
-# SAVE TIME VS VOLTAGE
+# CSV SOLICITADO 2
+#
+# t_s,Voltaje
 # ============================================================================
 
 def save_time_vs_voltage_csv(
@@ -551,7 +712,7 @@ def save_time_vs_voltage_csv(
 
 
 # ============================================================================
-# PLOTS
+# GRÁFICAS
 # ============================================================================
 
 def plot_curves(
@@ -560,11 +721,21 @@ def plot_curves(
     voltage_data: dict[str, np.ndarray],
     torque_destination: Path,
     voltage_destination: Path,
+    time_rpm_destination: Path,
+    time_voltage_destination: Path,
 ) -> None:
 
-    torque = torque_data["load_torque_Nm"]
+    # ------------------------------------------------------------------------
+    # DATOS DE TORQUE
+    # ------------------------------------------------------------------------
 
-    limited = torque_data["current_limited"]
+    torque = (
+        torque_data["load_torque_Nm"]
+    )
+
+    limited = (
+        torque_data["current_limited"]
+    )
 
     normal = ~limited
 
@@ -575,7 +746,7 @@ def plot_curves(
     )
 
     # ------------------------------------------------------------------------
-    # STYLE
+    # ESTILO GENERAL
     # ------------------------------------------------------------------------
 
     plt.rcParams.update(
@@ -598,7 +769,8 @@ def plot_curves(
     voltage_color = "#ff7f0e"
 
     # ========================================================================
-    # FIGURE 1
+    # FIGURA 1
+    # CARACTERÍSTICAS VS TORQUE
     # ========================================================================
 
     fig1, axes = plt.subplots(
@@ -616,6 +788,7 @@ def plot_curves(
         title,
     ):
 
+        # Región normal.
         ax.plot(
             torque[normal],
             y[normal],
@@ -624,6 +797,7 @@ def plot_curves(
             linewidth=2.3,
         )
 
+        # Región limitada por corriente.
         if np.any(limited):
 
             first_limited = int(
@@ -643,6 +817,7 @@ def plot_curves(
                 linewidth=2.3,
             )
 
+        # Punto donde comienza el límite.
         ax.axvline(
             limit_torque,
             color="0.30",
@@ -665,30 +840,13 @@ def plot_curves(
 
         ax.grid(
             True,
-            which="major",
             linestyle="--",
             linewidth=0.6,
             alpha=0.30,
         )
 
-        ax.minorticks_on()
-
-        ax.grid(
-            True,
-            which="minor",
-            linestyle=":",
-            linewidth=0.4,
-            alpha=0.12,
-        )
-
-        ax.tick_params(
-            direction="in",
-            top=True,
-            right=True,
-        )
-
     # ------------------------------------------------------------------------
-    # SPEED
+    # RPM VS TORQUE
     # ------------------------------------------------------------------------
 
     draw_curve(
@@ -700,7 +858,7 @@ def plot_curves(
     )
 
     # ------------------------------------------------------------------------
-    # CURRENT
+    # CORRIENTE VS TORQUE
     # ------------------------------------------------------------------------
 
     draw_curve(
@@ -718,27 +876,8 @@ def plot_curves(
         linewidth=1.2,
     )
 
-    axes[0, 1].set_ylim(
-        0.0,
-        1.08 * motor.current_limit,
-    )
-
-    axes[0, 1].annotate(
-        f"$I_{{max}}={motor.current_limit:.1f}$ A",
-        xy=(
-            torque[-1],
-            motor.current_limit,
-        ),
-        xytext=(-8, -10),
-        textcoords="offset points",
-        ha="right",
-        va="top",
-        fontsize=9,
-        color=current_color,
-    )
-
     # ------------------------------------------------------------------------
-    # POWER
+    # POTENCIA VS TORQUE
     # ------------------------------------------------------------------------
 
     draw_curve(
@@ -750,7 +889,7 @@ def plot_curves(
     )
 
     # ------------------------------------------------------------------------
-    # EFFICIENCY
+    # EFICIENCIA VS TORQUE
     # ------------------------------------------------------------------------
 
     draw_curve(
@@ -759,49 +898,6 @@ def plot_curves(
         efficiency_color,
         "Efficiency [%]",
         "Efficiency vs Load Torque",
-    )
-
-    from matplotlib.lines import Line2D
-
-    legend_elements = [
-
-        Line2D(
-            [0],
-            [0],
-            color="black",
-            linestyle="-",
-            linewidth=2.2,
-            label="Voltage-controlled region",
-        ),
-
-        Line2D(
-            [0],
-            [0],
-            color="black",
-            linestyle="--",
-            linewidth=2.2,
-            label=(
-                f"Current-limited region "
-                f"($I={motor.current_limit:.1f}$ A)"
-            ),
-        ),
-
-        Line2D(
-            [0],
-            [0],
-            color="0.30",
-            linestyle=":",
-            linewidth=1.2,
-            label="Current-limit transition",
-        ),
-    ]
-
-    fig1.legend(
-        handles=legend_elements,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.08),
-        ncol=3,
-        frameon=False,
     )
 
     fig1.savefig(
@@ -813,14 +909,9 @@ def plot_curves(
     plt.close(fig1)
 
     # ========================================================================
-    # FIGURE 2
-    # SPEED VS VOLTAGE
+    # FIGURA 2
+    # RPM VS VOLTAJE
     # ========================================================================
-
-    fig2, ax = plt.subplots(
-        figsize=(9.5, 6.5),
-        constrained_layout=True,
-    )
 
     voltage = (
         voltage_data["voltage_V"]
@@ -830,145 +921,83 @@ def plot_curves(
         voltage_data["speed_RPM"]
     )
 
+    # Obtener un solo punto por nivel de voltaje.
+
+    unique_voltage = np.arange(
+        6.0,
+        25.0,
+        1.0
+    )
+
+    unique_rpm = []
+
+    for v in unique_voltage:
+
+        indices = np.where(
+            np.isclose(
+                voltage,
+                v
+            )
+        )[0]
+
+        if len(indices) > 0:
+
+            unique_rpm.append(
+                speed_rpm[
+                    indices[-1]
+                ]
+            )
+
+    unique_rpm = np.array(
+        unique_rpm
+    )
+
+    fig2, ax = plt.subplots(
+        figsize=(9.5, 6.5),
+        constrained_layout=True,
+    )
+
     ax.plot(
-        voltage,
-        speed_rpm,
+        unique_voltage,
+        unique_rpm,
+        marker="o",
         color=voltage_color,
-        linewidth=3.2,
-    )
-
-    min_voltage = float(
-        voltage[0]
-    )
-
-    min_speed = float(
-        speed_rpm[0]
-    )
-
-    max_voltage = float(
-        voltage[-1]
-    )
-
-    max_speed = float(
-        speed_rpm[-1]
-    )
-
-    ax.scatter(
-        [
-            min_voltage,
-            max_voltage
-        ],
-        [
-            min_speed,
-            max_speed
-        ],
-        s=80,
-        color=voltage_color,
-        edgecolor="black",
-        linewidth=0.7,
-        zorder=5,
-    )
-
-    ax.annotate(
-        f"{min_speed:.0f} RPM",
-        xy=(
-            min_voltage,
-            min_speed
-        ),
-        xytext=(23, 3),
-        textcoords="offset points",
-        ha="left",
-        va="top",
-        fontsize=18,
-    )
-
-    ax.annotate(
-        f"{max_speed:.0f} RPM",
-        xy=(
-            max_voltage,
-            max_speed
-        ),
-        xytext=(-15, 15),
-        textcoords="offset points",
-        ha="right",
-        va="top",
-        fontsize=18,
+        linewidth=2.5,
     )
 
     ax.set_xlim(
-        6.0,
-        24.0
+        6,
+        24
     )
 
     ax.set_xticks(
         np.arange(
-            6.0,
-            24.1,
-            2.0
+            6,
+            25,
+            1
         )
-    )
-
-    y_padding = (
-        0.08
-        * (
-            max_speed
-            - min_speed
-        )
-    )
-
-    ax.set_ylim(
-        max(
-            0.0,
-            min_speed - y_padding
-        ),
-        max_speed
-        + 1.5 * y_padding,
     )
 
     ax.set_xlabel(
         "Motor Voltage [V]",
-        fontsize=23,
-        labelpad=10,
+        fontsize=18,
     )
 
     ax.set_ylabel(
         "Speed [RPM]",
-        fontsize=23,
-        labelpad=10,
+        fontsize=18,
     )
 
     ax.set_title(
         "No-Load Speed vs Motor Voltage",
-        fontsize=26,
+        fontsize=22,
         fontweight="bold",
-        pad=16,
     )
 
     ax.grid(
         True,
-        which="major",
         linestyle="--",
-        linewidth=0.6,
         alpha=0.30,
-    )
-
-    ax.minorticks_on()
-
-    ax.grid(
-        True,
-        which="minor",
-        linestyle=":",
-        linewidth=0.4,
-        alpha=0.12,
-    )
-
-    ax.tick_params(
-        direction="in",
-        top=True,
-        right=True,
-        labelsize=20,
-        length=6,
-        width=1.0,
     )
 
     fig2.savefig(
@@ -978,6 +1007,153 @@ def plot_curves(
     )
 
     plt.close(fig2)
+
+    # ========================================================================
+    # FIGURA 3
+    #
+    # RPM VS TIEMPO
+    #
+    # ESCALONES
+    # ========================================================================
+
+    time_s = (
+        voltage_data["time_s"]
+    )
+
+    final_time = float(
+        time_s[-1]
+    )
+
+    fig3, ax = plt.subplots(
+        figsize=(10, 6),
+        constrained_layout=True,
+    )
+
+    ax.plot(
+        time_s,
+        speed_rpm,
+        linewidth=2.5,
+        color=speed_color,
+    )
+
+    ax.set_xlim(
+        0,
+        final_time
+    )
+
+    ax.set_xticks(
+        np.arange(
+            0,
+            final_time + 1,
+            10
+        )
+    )
+
+    ax.set_xlabel(
+        "Time [s]",
+        fontsize=16,
+    )
+
+    ax.set_ylabel(
+        "Speed [RPM]",
+        fontsize=16,
+    )
+
+    ax.set_title(
+        "Speed vs Time - 1 V Step Every 10 s",
+        fontsize=20,
+        fontweight="bold",
+    )
+
+    ax.grid(
+        True,
+        linestyle="--",
+        alpha=0.30,
+    )
+
+    fig3.savefig(
+        time_rpm_destination,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+
+    plt.close(fig3)
+
+    # ========================================================================
+    # FIGURA 4
+    #
+    # VOLTAJE VS TIEMPO
+    #
+    # ESCALONES
+    # ========================================================================
+
+    fig4, ax = plt.subplots(
+        figsize=(10, 6),
+        constrained_layout=True,
+    )
+
+    ax.plot(
+        time_s,
+        voltage,
+        linewidth=2.5,
+        color=voltage_color,
+    )
+
+    ax.set_xlim(
+        0,
+        final_time
+    )
+
+    ax.set_ylim(
+        5.5,
+        24.5
+    )
+
+    ax.set_xticks(
+        np.arange(
+            0,
+            final_time + 1,
+            10
+        )
+    )
+
+    ax.set_yticks(
+        np.arange(
+            6,
+            25,
+            1
+        )
+    )
+
+    ax.set_xlabel(
+        "Time [s]",
+        fontsize=16,
+    )
+
+    ax.set_ylabel(
+        "Voltage [V]",
+        fontsize=16,
+    )
+
+    ax.set_title(
+        "Voltage vs Time - 1 V Step Every 10 s",
+        fontsize=20,
+        fontweight="bold",
+    )
+
+    ax.grid(
+        True,
+        linestyle="--",
+        alpha=0.30,
+    )
+
+    fig4.savefig(
+        time_voltage_destination,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+
+    plt.close(fig4)
 
 
 # ============================================================================
@@ -989,7 +1165,7 @@ def main() -> None:
     motor = Motor()
 
     # ------------------------------------------------------------------------
-    # OUTPUT DIRECTORY
+    # CARPETA DE RESULTADOS
     # ------------------------------------------------------------------------
 
     output_directory = (
@@ -1002,7 +1178,9 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------------
-    # CALCULATE TORQUE CURVES
+    # CASO 1
+    #
+    # CURVAS VS TORQUE
     # ------------------------------------------------------------------------
 
     torque_data = torque_characteristics(
@@ -1011,24 +1189,32 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------------
-    # CALCULATE 6 V -> 24 V SWEEP
+    # CASO 2
     #
-    # 1 V every 10 seconds
+    # BARRIDO ESCALONADO
     #
-    # Total time:
+    # 0 - 10 s      -> 6 V
+    # 10 - 20 s     -> 7 V
+    # 20 - 30 s     -> 8 V
+    # ...
+    # 170 - 180 s   -> 23 V
+    # 180 s         -> 24 V
     #
-    # (24 - 6) * 10 = 180 seconds
+    # Incremento = 1 V cada 10 s
+    #
+    # Corriente máxima = 1 A
     # ------------------------------------------------------------------------
 
     voltage_data = voltage_speed_characteristic(
         motor,
         minimum_voltage=6.0,
-        samples=500,
-        seconds_per_volt=10.0,
+        maximum_voltage=24.0,
+        voltage_step=1.0,
+        seconds_per_step=10.0,
     )
 
     # ------------------------------------------------------------------------
-    # SAVE ORIGINAL DATA
+    # CSV GENERAL DEL TORQUE
     # ------------------------------------------------------------------------
 
     save_csv(
@@ -1037,6 +1223,10 @@ def main() -> None:
         / "torque_characteristics.csv",
     )
 
+    # ------------------------------------------------------------------------
+    # CSV GENERAL DEL BARRIDO
+    # ------------------------------------------------------------------------
+
     save_csv(
         voltage_data,
         output_directory
@@ -1044,7 +1234,9 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------------
-    # SAVE REQUIRED CSV FILES
+    # CSV SOLICITADO 1
+    #
+    # t_s,Rpm
     # ------------------------------------------------------------------------
 
     save_time_vs_rpm_csv(
@@ -1053,6 +1245,12 @@ def main() -> None:
         / "tiempo_vs_rpm.csv",
     )
 
+    # ------------------------------------------------------------------------
+    # CSV SOLICITADO 2
+    #
+    # t_s,Voltaje
+    # ------------------------------------------------------------------------
+
     save_time_vs_voltage_csv(
         voltage_data,
         output_directory
@@ -1060,22 +1258,32 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------------
-    # PLOTS
+    # GRÁFICAS
     # ------------------------------------------------------------------------
 
     plot_curves(
         motor,
         torque_data,
         voltage_data,
+
         output_directory
         / "motor_characteristics_vs_torque.png",
+
         output_directory
         / "speed_vs_voltage.png",
+
+        output_directory
+        / "rpm_vs_tiempo.png",
+
+        output_directory
+        / "voltaje_vs_tiempo.png",
     )
 
     # ------------------------------------------------------------------------
-    # PRINT RESULTS
+    # RESULTADOS EN TERMINAL
     # ------------------------------------------------------------------------
+
+    print()
 
     print(
         "============================================================"
@@ -1089,20 +1297,10 @@ def main() -> None:
         "============================================================"
     )
 
-    print(
-        f"Ke = "
-        f"{motor.back_emf_constant:.8f} V/(rad/s)"
-    )
-
-    print(
-        f"B  = "
-        f"{motor.viscous_friction:.8e} N*m*s/rad"
-    )
-
     print()
 
     print(
-        "DRIVER LIMIT - TORQUE TEST"
+        "BARRIDO ESCALONADO DE VOLTAJE"
     )
 
     print(
@@ -1110,52 +1308,79 @@ def main() -> None:
     )
 
     print(
-        f"Current limit = "
-        f"{motor.current_limit:.3f} A"
+        "Voltaje inicial : 6 V"
     )
 
     print(
-        f"Load torque at current limit = "
-        f"{torque_data['current_limit_torque_Nm']:.6f} N*m"
+        "Voltaje final   : 24 V"
     )
 
     print(
-        f"Speed at current limit = "
-        f"{torque_data['current_limit_speed_RPM']:.2f} RPM"
+        "Incremento      : 1 V"
+    )
+
+    print(
+        "Tiempo/escalón  : 10 s"
+    )
+
+    print(
+        "Tiempo total    : 180 s"
+    )
+
+    print(
+        "Corriente máx.  : 1 A"
     )
 
     print()
 
     print(
-        "VOLTAGE SWEEP"
+        "SECUENCIA:"
     )
 
     print(
         "------------------------------------------------------------"
     )
 
-    print(
-        "Voltage range = 6 V -> 24 V"
-    )
+    # ------------------------------------------------------------------------
+    # Mostrar la secuencia completa.
+    # ------------------------------------------------------------------------
 
-    print(
-        "Voltage rate = 1 V every 10 s"
-    )
+    for voltage_level in range(
+        6,
+        25
+    ):
 
-    print(
-        f"Total sweep time = "
-        f"{voltage_data['time_s'][-1]:.1f} s"
-    )
+        time_level = (
+            voltage_level - 6
+        ) * 10
 
-    print(
-        f"Maximum current = "
-        f"{motor.voltage_sweep_current_limit:.1f} A"
-    )
+        indices = np.where(
+            np.isclose(
+                voltage_data["voltage_V"],
+                voltage_level
+            )
+        )[0]
+
+        if len(indices) > 0:
+
+            rpm_level = (
+                voltage_data["speed_RPM"][
+                    indices[-1]
+                ]
+            )
+
+            print(
+                f"{time_level:3d} s"
+                f" -> "
+                f"{voltage_level:2d} V"
+                f" -> "
+                f"{rpm_level:8.2f} RPM"
+            )
 
     print()
 
     print(
-        "CSV FILES"
+        "ARCHIVOS CSV:"
     )
 
     print(
@@ -1167,7 +1392,7 @@ def main() -> None:
     )
 
     print(
-        "Header: t_s,Rpm"
+        "    t_s,Rpm"
     )
 
     print()
@@ -1177,19 +1402,70 @@ def main() -> None:
     )
 
     print(
-        "Header: t_s,Voltaje"
+        "    t_s,Voltaje"
     )
 
     print()
 
     print(
-        f"Results saved in: "
-        f"{output_directory}"
+        "FORMA DEL ESCALÓN DE VOLTAJE:"
     )
+
+    print(
+        "------------------------------------------------------------"
+    )
+
+    print(
+        "0   s -> 6 V"
+    )
+
+    print(
+        "10  s -> 6 V"
+    )
+
+    print(
+        "10  s -> 7 V"
+    )
+
+    print(
+        "20  s -> 7 V"
+    )
+
+    print(
+        "20  s -> 8 V"
+    )
+
+    print(
+        "..."
+    )
+
+    print(
+        "170 s -> 23 V"
+    )
+
+    print(
+        "180 s -> 23 V"
+    )
+
+    print(
+        "180 s -> 24 V"
+    )
+
+    print()
+
+    print(
+        "Resultados guardados en:"
+    )
+
+    print(
+        output_directory
+    )
+
+    print()
 
 
 # ============================================================================
-# RUN
+# EJECUTAR
 # ============================================================================
 
 if __name__ == "__main__":
