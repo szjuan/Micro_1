@@ -83,6 +83,15 @@ _Pe_buf:  list[float] = []   # potencia eléctrica [W]
 _Pm_buf:  list[float] = []   # potencia mecánica [W]
 _eta_buf: list[float] = []   # eficiencia [%]
 
+def _resetear_tiempo():
+    """Vacía buffers y pone t=0 en el origen del ensayo."""
+    global _inicio_tiempo
+    with _lock:
+        for buf in (_t_buf, _n_buf, _w_buf, _FL_buf, _TL_buf,
+                    _V_buf, _I_buf, _Pe_buf, _Pm_buf, _eta_buf):
+            buf.clear()
+    _inicio_tiempo = time.time()
+
 # Registro completo (todos los campos, para CSV)
 _registros: list[dict] = []
 
@@ -932,12 +941,14 @@ class _PantallaGraficas(QWidget):
 
     def __init__(self, volver_cb=None):
         super().__init__()
-        self._prueba   = "prueba1"
-        self._volver_cb = volver_cb   # callback para volver al menú de pruebas
+        self._prueba        = "prueba1"
+        self._volver_cb     = volver_cb
+        self._ensayo_activo = False
         self._construir()
 
     def set_prueba(self, prueba: str):
         self._prueba = prueba
+        self._ensayo_activo = False
         nombres = {
             "prueba1": "Prueba 1 · Velocidad vs Voltaje",
             "prueba2": "Prueba 2 · Caracterización con Freno",
@@ -1111,7 +1122,14 @@ class _PantallaGraficas(QWidget):
             }}
             QPushButton:hover {{ background-color:#E3C000; }}
         """)
-        btn_ap.clicked.connect(lambda: _set_voltaje(getattr(self, spin_attr).value()))
+        def _on_aplicar():
+            _set_voltaje(getattr(self, spin_attr).value())
+            self._ensayo_activo = True
+            if spin_attr == "_spin_volt":
+                self._mostrar_teo_p1()
+            else:
+                self._mostrar_teo_p2()
+        btn_ap.clicked.connect(_on_aplicar)
         row_f = QHBoxLayout(); row_f.setSpacing(6)
         row_f.addWidget(spin, stretch=1); row_f.addWidget(btn_ap)
         v.addLayout(row_f)
@@ -1335,6 +1353,8 @@ class _PantallaGraficas(QWidget):
 
     # ── actualización en tiempo real ──────────────────────────
     def _tick(self):
+        if not self._ensayo_activo:
+            return
         with _lock:
             if not _t_buf:
                 return
@@ -1381,14 +1401,31 @@ class _PantallaGraficas(QWidget):
         if checked:
             self._btn_esc.setText("⏹  Detener")
             self._btn_esc.setStyleSheet(self._btn_esc_style_det)
+
+            v_ini = self._spin_v_ini.value()
+
+            # 1. Limpiar curvas experimentales P1 (las teóricas se conservan)
+            for c in (self._curva_top, self._curva_top2,
+                      self._curva_bot, self._curva_bot2):
+                c.setData([], [])
+
+            # 2. Resetear tiempo y buffers → t=0 al inicio del ensayo
+            _resetear_tiempo()
+
+            # 3. Aplicar V_inicio de forma síncrona antes de arrancar el hilo
+            _set_voltaje(v_ini)
+
+            # 4. Habilitar graficación y mostrar teóricas
+            self._ensayo_activo = True
+            self._mostrar_teo_p1()
+
+            # 5. Arrancar hilo de escalones (empezará desde v_ini)
             threading.Thread(
                 target=_run_escalones,
-                args=(
-                    self._spin_v_ini.value(),
-                    self._spin_v_fin.value(),
-                    self._spin_paso.value(),
-                    self._spin_dur.value(),
-                ),
+                args=(v_ini,
+                      self._spin_v_fin.value(),
+                      self._spin_paso.value(),
+                      self._spin_dur.value()),
                 daemon=True,
             ).start()
         else:
@@ -1437,7 +1474,7 @@ class _PantallaGraficas(QWidget):
 
     # ── Importar CSVs teóricos ────────────────────────────────
     def _importar_csv_teo(self, tipo: str):
-        """Lee un CSV de dos columnas (tiempo, valor) y lo grafica como curva teórica."""
+        """Lee un CSV (tiempo, valor) y guarda los datos; NO los grafica hasta iniciar ensayo."""
         titulo = "n(t) teórico — RPM" if tipo == "n" else "V(t) teórico — Voltaje"
         ruta, _ = QFileDialog.getOpenFileName(
             self, f"Importar {titulo}", "", "CSV (*.csv);;Todos (*)"
@@ -1447,30 +1484,29 @@ class _PantallaGraficas(QWidget):
         try:
             t_teo, y_teo = [], []
             with open(ruta, newline="", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                for i, row in enumerate(reader):
+                for row in csv.reader(f):
                     if len(row) < 2:
                         continue
                     try:
                         t_teo.append(float(row[0]))
                         y_teo.append(float(row[1]))
                     except ValueError:
-                        continue   # salta encabezado u otras filas no numéricas
+                        continue
 
             nombre = os.path.basename(ruta)
             _sty_ok = "font-size:9px; color:#7EE787; padding-left:12px;"
             if tipo == "n":
-                self._curva_top_teo.setData(t_teo, y_teo)
+                self._teo_n_data = (t_teo, y_teo)   # guardado, no graficado aún
                 self._lbl_teo_n.setText(f"✓ {nombre}")
                 self._lbl_teo_n.setStyleSheet(_sty_ok)
                 self._lbl_teo_n.setToolTip(nombre)
             else:
-                self._curva_bot_teo.setData(t_teo, y_teo)
+                self._teo_v_data = (t_teo, y_teo)
                 self._lbl_teo_v.setText(f"✓ {nombre}")
                 self._lbl_teo_v.setStyleSheet(_sty_ok)
                 self._lbl_teo_v.setToolTip(nombre)
 
-            señales.conexion_msg.emit(f"CSV teórico cargado: {nombre}")
+            señales.conexion_msg.emit(f"CSV teórico listo (se graficará al iniciar): {nombre}")
         except Exception as e:
             señales.conexion_msg.emit(f"Error al leer CSV teórico: {e}")
 
@@ -1480,8 +1516,28 @@ class _PantallaGraficas(QWidget):
     def _importar_csv_teo_v(self):
         self._importar_csv_teo("V")
 
+    def _mostrar_teo_p1(self):
+        """Grafica las curvas teóricas de P1 si están cargadas."""
+        if hasattr(self, "_teo_n_data") and self._teo_n_data:
+            self._curva_top_teo.setData(*self._teo_n_data)
+        if hasattr(self, "_teo_v_data") and self._teo_v_data:
+            self._curva_bot_teo.setData(*self._teo_v_data)
+
+    def _mostrar_teo_p2(self):
+        """Grafica las curvas teóricas de P2 si están cargadas."""
+        _map = [
+            ("_teo_p2_w_data",  self._p2_ct_w),
+            ("_teo_p2_i_data",  self._p2_ct_i),
+            ("_teo_p2_pm_data", self._p2_ct_pm),
+            ("_teo_p2_n_data",  self._p2_ct_n),
+        ]
+        for attr, curva in _map:
+            if hasattr(self, attr) and getattr(self, attr):
+                curva.setData(*getattr(self, attr))
+
     # ── Importar CSVs teóricos Prueba 2 (vs TL) ──────────────
-    def _importar_csv_p2(self, curva, lbl_attr: str, titulo: str):
+    def _importar_csv_p2(self, data_attr: str, lbl_attr: str, titulo: str):
+        """Guarda datos teóricos P2; NO los grafica hasta pulsar Aplicar."""
         ruta, _ = QFileDialog.getOpenFileName(
             self, f"Importar {titulo} teórico", "", "CSV (*.csv);;Todos (*)"
         )
@@ -1497,27 +1553,27 @@ class _PantallaGraficas(QWidget):
                         x.append(float(row[0])); y.append(float(row[1]))
                     except ValueError:
                         continue
-            curva.setData(x, y)
+            setattr(self, data_attr, (x, y))   # guardado, no graficado aún
             nombre = os.path.basename(ruta)
             lbl = getattr(self, lbl_attr)
             lbl.setText(f"✓ {nombre}")
             lbl.setStyleSheet("font-size:9px; color:#7EE787; padding-left:12px;")
             lbl.setToolTip(nombre)
-            señales.conexion_msg.emit(f"CSV teórico cargado: {nombre}")
+            señales.conexion_msg.emit(f"CSV teórico listo (se graficará al aplicar): {nombre}")
         except Exception as e:
             señales.conexion_msg.emit(f"Error CSV teórico: {e}")
 
     def _importar_csv_p2_w(self):
-        self._importar_csv_p2(self._p2_ct_w,  "_lbl_teo_p2_w",  "n(TL)")
+        self._importar_csv_p2("_teo_p2_w_data", "_lbl_teo_p2_w",  "n(TL)")
 
     def _importar_csv_p2_i(self):
-        self._importar_csv_p2(self._p2_ct_i,  "_lbl_teo_p2_i",  "I(TL)")
+        self._importar_csv_p2("_teo_p2_i_data", "_lbl_teo_p2_i",  "I(TL)")
 
     def _importar_csv_p2_pm(self):
-        self._importar_csv_p2(self._p2_ct_pm, "_lbl_teo_p2_pm", "Pm(TL)")
+        self._importar_csv_p2("_teo_p2_pm_data","_lbl_teo_p2_pm", "Pm(TL)")
 
     def _importar_csv_p2_n(self):
-        self._importar_csv_p2(self._p2_ct_n,  "_lbl_teo_p2_n",  "η(TL)")
+        self._importar_csv_p2("_teo_p2_n_data", "_lbl_teo_p2_n",  "η(TL)")
 
     def _volver_menu(self):
         """Detiene escalones activos y vuelve a la pantalla de selección de prueba."""
