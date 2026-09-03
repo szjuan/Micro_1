@@ -31,7 +31,7 @@ from serial.tools import list_ports
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QHBoxLayout, QLabel,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QFrame, QStackedWidget,
     QScrollArea, QFileDialog, QMessageBox,
     QSizePolicy, QDoubleSpinBox,
@@ -930,9 +930,10 @@ class _PantallaPrueba(QWidget):
 # ============================================================
 class _PantallaGraficas(QWidget):
 
-    def __init__(self):
+    def __init__(self, volver_cb=None):
         super().__init__()
-        self._prueba = "prueba1"
+        self._prueba   = "prueba1"
+        self._volver_cb = volver_cb   # callback para volver al menú de pruebas
         self._construir()
 
     def set_prueba(self, prueba: str):
@@ -942,6 +943,10 @@ class _PantallaGraficas(QWidget):
             "prueba2": "Prueba 2 · Caracterización con Freno",
         }
         self._lbl_titulo.setText(nombres.get(prueba, "Ensayo"))
+
+        es_p1 = (prueba == "prueba1")
+        self._panel_stack.setCurrentIndex(0 if es_p1 else 1)
+        self._graf_stack.setCurrentIndex(0 if es_p1 else 1)
 
     # ── construcción de la UI ─────────────────────────────────
     def _construir(self):
@@ -964,98 +969,141 @@ class _PantallaGraficas(QWidget):
         # ── Cuerpo principal (panel izquierdo + gráficas)
         body = QHBoxLayout(); body.setSpacing(12)
 
-        # Panel izquierdo — variables + controles
-        self._panel_vars = self._hacer_panel_vars()
-        body.addWidget(self._panel_vars, stretch=0)
+        # Panel izquierdo — QStackedWidget: índice 0=P1, 1=P2
+        self._panel_stack = QStackedWidget()
+        self._panel_stack.setFixedWidth(232)
+        self._panel_p1 = self._hacer_panel_p1()
+        self._panel_p2 = self._hacer_panel_p2()
+        self._panel_stack.addWidget(self._panel_p1)   # index 0
+        self._panel_stack.addWidget(self._panel_p2)   # index 1
+        body.addWidget(self._panel_stack, stretch=0)
 
-        # Panel derecho — gráficas
-        graficas_col = QVBoxLayout(); graficas_col.setSpacing(8)
+        # Panel derecho — QStackedWidget: P1 (2 vertical) | P2 (2×2)
+        self._graf_stack = QStackedWidget()
+
+        # ── Prueba 1: dos gráficas apiladas ────────────────────
+        w_p1 = QWidget(); col_p1 = QVBoxLayout(w_p1); col_p1.setSpacing(8); col_p1.setContentsMargins(0,0,0,0)
         self._plot_top, self._curva_top, self._curva_top2 = self._make_plot_dual()
         self._plot_bot, self._curva_bot, self._curva_bot2 = self._make_plot_dual()
-        graficas_col.addWidget(self._plot_top, stretch=1)
-        graficas_col.addWidget(self._plot_bot, stretch=1)
-        body.addLayout(graficas_col, stretch=1)
+        _pen_teo_n = pg.mkPen(color="#FFFFFF", width=1.8, style=Qt.PenStyle.DashLine)
+        _pen_teo_v = pg.mkPen(color="#FFD700", width=1.8, style=Qt.PenStyle.DashLine)
+        self._curva_top_teo = self._plot_top.plot(pen=_pen_teo_n, name="n(t) Teórico")
+        self._curva_bot_teo = self._plot_bot.plot(pen=_pen_teo_v, name="V(t) Teórico")
+        col_p1.addWidget(self._plot_top, stretch=1)
+        col_p1.addWidget(self._plot_bot, stretch=1)
+        self._graf_stack.addWidget(w_p1)   # index 0
+
+        # ── Prueba 2: cuatro gráficas 2×2 (vs TL) ─────────────
+        w_p2 = QWidget(); grid_p2 = QGridLayout(w_p2); grid_p2.setSpacing(8); grid_p2.setContentsMargins(0,0,0,0)
+
+        _pen_exp = lambda c: pg.mkPen(color=c, width=2.2)
+        _pen_teo = lambda c: pg.mkPen(color=c, width=1.8, style=Qt.PenStyle.DashLine)
+
+        def _make_p2_plot(title, ylabel, color_exp, color_teo):
+            pw = pg.PlotWidget(); pw.setBackground(_BG)
+            pw.showGrid(x=True, y=True, alpha=0.15)
+            pw.setTitle(title, color="#C9D1D9", size="11pt")
+            for ax in ("left","bottom"):
+                pw.getAxis(ax).setPen(pg.mkPen(color=_BORDER))
+                pw.getAxis(ax).setTextPen(pg.mkPen(color=_SEC))
+            pw.setLabel("left", ylabel, color=_SEC)
+            pw.setLabel("bottom", "TL (N·m)", color=_SEC)
+            c_exp = pw.plot(pen=_pen_exp(color_exp), name="Experimental")
+            c_teo = pw.plot(pen=_pen_teo(color_teo),  name="Teórico")
+            return pw, c_exp, c_teo
+
+        self._p2_plot_w,  self._p2_c_w,  self._p2_ct_w  = _make_p2_plot("n vs TL",  "Velocidad (RPM)",      _CYAN,   "#FFFFFF")
+        self._p2_plot_i,  self._p2_c_i,  self._p2_ct_i  = _make_p2_plot("I vs TL",  "Corriente (A)",        _ORANGE, "#FFD700")
+        self._p2_plot_pm, self._p2_c_pm, self._p2_ct_pm = _make_p2_plot("Pm vs TL", "Pot. mec. (W)",        _PURPLE, "#C0A0FF")
+        self._p2_plot_n,  self._p2_c_n,  self._p2_ct_n  = _make_p2_plot("η vs TL",  "Eficiencia (%)",       "#58A6FF","#A0D0FF")
+
+        grid_p2.addWidget(self._p2_plot_w,  0, 0)
+        grid_p2.addWidget(self._p2_plot_i,  0, 1)
+        grid_p2.addWidget(self._p2_plot_pm, 1, 0)
+        grid_p2.addWidget(self._p2_plot_n,  1, 1)
+        self._graf_stack.addWidget(w_p2)   # index 1
+
+        body.addWidget(self._graf_stack, stretch=1)
 
         root.addLayout(body, stretch=1)
 
         # ── Timer
         tmr = QTimer(self); tmr.timeout.connect(self._tick); tmr.start(100)
         señales.conexion_msg.connect(lambda m: self._lbl_conn.setText(m))
-        señales.punto_capturado.connect(
-            lambda n: self._lbl_puntos.setText(f"Puntos capturados: {n}")
-        )
         señales.escalon_progreso.connect(self._on_escalon_progreso)
 
-    def _hacer_panel_vars(self) -> QFrame:
-        panel = QFrame(); panel.setObjectName("panel_vars")
-        panel.setFixedWidth(230)
-        v = QVBoxLayout(panel); v.setSpacing(6); v.setContentsMargins(14, 14, 14, 14)
+    # ── Helpers de panel compartidos ─────────────────────────────
+    def _sty_spin_ctrl(self) -> str:
+        return f"""
+            QDoubleSpinBox {{
+                background:#21262D; color:{_PRI};
+                border:1px solid {_BORDER}; border-radius:4px;
+                font-size:11px; padding:1px 3px;
+            }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+                width:14px; background:#30363D; border:none;
+            }}
+        """
 
+    def _seccion_vars(self, v: QVBoxLayout, lbl_dict_attr: str):
+        """Añade la tabla de 9 variables al layout v, guarda labels en self.<lbl_dict_attr>."""
         lbl_h = QLabel("Variables actuales")
         lbl_h.setStyleSheet(f"font-size:12px; font-weight:bold; color:{_SEC};")
         v.addWidget(lbl_h); v.addWidget(_sep())
-
-        # Definición de variables con color y unidad
-        self._vars_def = [
-            ("n",   "RPM Final",    "RPM",   _CYAN),
-            ("ω",   "Vel. angular", "rad/s", _CYAN),
-            ("V",   "Voltaje",      "V",     _YELLOW),
-            ("I",   "Corriente",    "A",     _YELLOW),
-            ("FL",  "F. galga",     "N",     _GREEN_H),
-            ("TL",  "Torque",       "N·m",   _RED_C),
-            ("Pe",  "Pot. eléct.",  "W",     _ORANGE),
-            ("Pm",  "Pot. mec.",    "W",     _PURPLE),
-            ("η",   "Eficiencia",   "%",     "#58A6FF"),
+        _vars_def = [
+            ("n",  "RPM Final",    "RPM",   _CYAN),
+            ("ω",  "Vel. angular", "rad/s", _CYAN),
+            ("V",  "Voltaje",      "V",     _YELLOW),
+            ("I",  "Corriente",    "A",     _YELLOW),
+            ("FL", "F. galga",     "N",     _GREEN_H),
+            ("TL", "Torque",       "N·m",   _RED_C),
+            ("Pe", "Pot. eléct.",  "W",     _ORANGE),
+            ("Pm", "Pot. mec.",    "W",     _PURPLE),
+            ("η",  "Eficiencia",   "%",     "#58A6FF"),
         ]
-        self._lbl_vars: dict[str, QLabel] = {}
-        for sym, nombre, unidad, color in self._vars_def:
+        d: dict[str, QLabel] = {}
+        for sym, nombre, unidad, color in _vars_def:
             row = QHBoxLayout(); row.setSpacing(4)
-            l_sym = QLabel(sym)
-            l_sym.setFixedWidth(26)
+            l_sym = QLabel(sym); l_sym.setFixedWidth(24)
             l_sym.setStyleSheet(f"font-size:13px; font-weight:bold; color:{color};")
-            l_nom = QLabel(nombre)
-            l_nom.setStyleSheet(f"font-size:10px; color:{_SEC};")
+            l_nom = QLabel(nombre); l_nom.setStyleSheet(f"font-size:10px; color:{_SEC};")
             l_nom.setFixedWidth(76)
             l_val = QLabel("—")
             l_val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             l_val.setStyleSheet(f"font-size:12px; font-weight:bold; color:{_PRI};")
-            l_uni = QLabel(unidad)
-            l_uni.setStyleSheet(f"font-size:10px; color:{_SEC};")
+            l_uni = QLabel(unidad); l_uni.setStyleSheet(f"font-size:10px; color:{_SEC};")
             l_uni.setFixedWidth(34)
             row.addWidget(l_sym); row.addWidget(l_nom)
             row.addWidget(l_val); row.addWidget(l_uni)
-            v.addLayout(row)
-            self._lbl_vars[sym] = l_val
-
+            v.addLayout(row); d[sym] = l_val
+        setattr(self, lbl_dict_attr, d)
         v.addWidget(_sep())
 
-        # ── Control Fuente Keysight ─────────────────────────────
-        lbl_fuente = QLabel("Control Fuente · CH1")
-        lbl_fuente.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_YELLOW};")
-        v.addWidget(lbl_fuente)
+    def _seccion_fuente(self, v: QVBoxLayout, spin_attr: str, outp_attr: str):
+        """Añade control fuente CH1 al layout v."""
+        lbl_f = QLabel("Control Fuente · CH1")
+        lbl_f.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_YELLOW};")
+        v.addWidget(lbl_f)
 
-        # Fila: spinbox voltaje + botón Aplicar
-        row_v = QHBoxLayout(); row_v.setSpacing(6)
-        self._spin_volt = QDoubleSpinBox()
-        self._spin_volt.setRange(0.0, 30.0)
-        self._spin_volt.setSingleStep(0.5)
-        self._spin_volt.setDecimals(1)
-        self._spin_volt.setSuffix(" V")
-        self._spin_volt.setValue(0.0)
-        self._spin_volt.setFixedHeight(32)
-        self._spin_volt.setStyleSheet(f"""
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 30.0); spin.setSingleStep(0.5)
+        spin.setDecimals(1); spin.setSuffix(" V"); spin.setValue(0.0)
+        spin.setFixedHeight(28)
+        spin.setStyleSheet(f"""
             QDoubleSpinBox {{
                 background:#21262D; color:{_PRI};
                 border:1px solid {_BORDER}; border-radius:5px;
-                font-size:13px; padding:2px 6px;
+                font-size:12px; padding:1px 5px;
             }}
             QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
-                width:18px; background:#30363D; border:none;
+                width:16px; background:#30363D; border:none;
             }}
         """)
-        btn_aplicar = QPushButton("Aplicar")
-        btn_aplicar.setFixedHeight(32)
-        btn_aplicar.setStyleSheet(f"""
+        setattr(self, spin_attr, spin)
+
+        btn_ap = QPushButton("Aplicar")
+        btn_ap.setFixedHeight(28)
+        btn_ap.setStyleSheet(f"""
             QPushButton {{
                 background-color:{_YELLOW}; color:#0D1117;
                 border:none; border-radius:5px;
@@ -1063,165 +1111,179 @@ class _PantallaGraficas(QWidget):
             }}
             QPushButton:hover {{ background-color:#E3C000; }}
         """)
-        btn_aplicar.clicked.connect(
-            lambda: _set_voltaje(self._spin_volt.value())
-        )
-        row_v.addWidget(self._spin_volt, stretch=1)
-        row_v.addWidget(btn_aplicar)
-        v.addLayout(row_v)
+        btn_ap.clicked.connect(lambda: _set_voltaje(getattr(self, spin_attr).value()))
+        row_f = QHBoxLayout(); row_f.setSpacing(6)
+        row_f.addWidget(spin, stretch=1); row_f.addWidget(btn_ap)
+        v.addLayout(row_f)
 
-        # Botón ON/OFF salida
-        self._btn_outp = QPushButton("⚡  Salida ON")
-        self._btn_outp.setCheckable(True)
-        self._btn_outp.setChecked(True)
-        self._btn_outp.setFixedHeight(32)
-        self._btn_outp_style_on  = f"""
-            QPushButton {{
-                background-color:#1A4D2E; color:#39D353;
-                border:1px solid #39D353; border-radius:5px;
-                font-size:11px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background-color:#245C38; }}
-        """
-        self._btn_outp_style_off = f"""
-            QPushButton {{
-                background-color:#3D1515; color:#FF7B72;
-                border:1px solid #FF7B72; border-radius:5px;
-                font-size:11px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background-color:#5C1F1F; }}
-        """
-        self._btn_outp.setStyleSheet(self._btn_outp_style_on)
-        self._btn_outp.toggled.connect(self._toggle_output)
-        v.addWidget(self._btn_outp)
-
+        sty_on  = f"""QPushButton {{
+            background-color:#1A4D2E; color:#39D353;
+            border:1px solid #39D353; border-radius:5px;
+            font-size:11px; font-weight:bold;
+            padding-top:2px; padding-bottom:6px;
+        }} QPushButton:hover {{ background-color:#245C38; }}"""
+        sty_off = f"""QPushButton {{
+            background-color:#3D1515; color:#FF7B72;
+            border:1px solid #FF7B72; border-radius:5px;
+            font-size:11px; font-weight:bold;
+            padding-top:2px; padding-bottom:6px;
+        }} QPushButton:hover {{ background-color:#5C1F1F; }}"""
+        btn_out = QPushButton("⚡  Salida ON")
+        btn_out.setCheckable(True); btn_out.setChecked(True)
+        btn_out.setFixedHeight(32)
+        btn_out.setStyleSheet(sty_on)
+        def _toggle(checked, b=btn_out, s_on=sty_on, s_off=sty_off):
+            _set_output(checked)
+            b.setText("⚡  Salida ON" if checked else "○  Salida OFF")
+            b.setStyleSheet(s_on if checked else s_off)
+        btn_out.toggled.connect(_toggle)
+        setattr(self, outp_attr, btn_out)
+        v.addWidget(btn_out)
         v.addWidget(_sep())
 
-        # ── Prueba de Escalones de Voltaje ─────────────────────
+    @staticmethod
+    def _bloque_csv_ui(nombre_var: str, slot, parent_layout: QVBoxLayout):
+        """Botón CSV + label estado. Retorna (btn, lbl)."""
+        sty = f"""
+            QPushButton {{
+                background-color:#21262D; color:{_PRI};
+                border:1px solid {_BORDER}; border-radius:5px;
+                font-size:11px; font-weight:bold;
+                text-align:left; padding-left:10px;
+                padding-top:2px; padding-bottom:6px;
+            }}
+            QPushButton:hover {{ background-color:#30363D; }}
+        """
+        btn = QPushButton(f"📂  {nombre_var}")
+        btn.setFixedHeight(32); btn.setStyleSheet(sty)
+        btn.clicked.connect(slot)
+        lbl = QLabel("sin archivo")
+        lbl.setStyleSheet(f"font-size:9px; color:{_SEC}; padding-left:12px;")
+        lbl.setFixedHeight(14)
+        parent_layout.addWidget(btn)
+        parent_layout.addWidget(lbl)
+        return btn, lbl
+
+    @staticmethod
+    def _btn_nav(texto: str, color_txt: str, color_bg: str,
+                 color_border: str, color_hover: str) -> QPushButton:
+        b = QPushButton(texto); b.setFixedHeight(32)
+        b.setStyleSheet(f"""
+            QPushButton {{
+                background-color:{color_bg}; color:{color_txt};
+                border:1px solid {color_border};
+                border-radius:6px; font-size:12px; font-weight:bold;
+            }}
+            QPushButton:hover {{ background-color:{color_hover}; }}
+        """)
+        return b
+
+    # ─────────────────────────────────────────────────────────────
+    #  Panel Prueba 1: Variables · Fuente · Escalones · CSV P1
+    # ─────────────────────────────────────────────────────────────
+    def _hacer_panel_p1(self) -> QFrame:
+        panel = QFrame(); panel.setObjectName("panel_p1")
+        v = QVBoxLayout(panel); v.setSpacing(5); v.setContentsMargins(10, 10, 10, 10)
+
+        self._seccion_vars(v, "_lbl_vars_p1")
+        self._seccion_fuente(v, "_spin_volt",  "_btn_outp")
+
+        # ── Prueba de Escalones ────────────────────────────────
         lbl_esc = QLabel("Prueba de Escalones")
         lbl_esc.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_CYAN};")
         v.addWidget(lbl_esc)
 
-        def _spin_esc(lo, hi, val, step, dec, suf):
+        sty_s = self._sty_spin_ctrl()
+        def _spin(lo, hi, val, step, dec, suf):
             s = QDoubleSpinBox()
-            s.setRange(lo, hi); s.setValue(val)
-            s.setSingleStep(step); s.setDecimals(dec)
-            s.setSuffix(suf); s.setFixedHeight(28)
-            s.setStyleSheet(f"""
-                QDoubleSpinBox {{
-                    background:#21262D; color:{_PRI};
-                    border:1px solid {_BORDER}; border-radius:4px;
-                    font-size:12px; padding:1px 4px;
-                }}
-                QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
-                    width:16px; background:#30363D; border:none;
-                }}
-            """)
-            return s
+            s.setRange(lo, hi); s.setValue(val); s.setSingleStep(step)
+            s.setDecimals(dec); s.setSuffix(suf); s.setFixedHeight(24)
+            s.setStyleSheet(sty_s); return s
 
-        def _row_param(label, widget):
-            r = QHBoxLayout(); r.setSpacing(4)
-            l = QLabel(label)
-            l.setStyleSheet(f"font-size:10px; color:{_SEC};")
-            l.setFixedWidth(58)
-            r.addWidget(l); r.addWidget(widget)
-            return r
+        def _col(label, widget):
+            c = QVBoxLayout(); c.setSpacing(1)
+            l = QLabel(label); l.setStyleSheet(f"font-size:9px; color:{_SEC};")
+            c.addWidget(l); c.addWidget(widget); return c
 
-        self._spin_v_ini  = _spin_esc(0.0, 30.0, 6.0,  0.5, 1, " V")
-        self._spin_v_fin  = _spin_esc(0.0, 30.0, 24.0, 0.5, 1, " V")
-        self._spin_paso   = _spin_esc(0.5, 10.0, 2.0,  0.5, 1, " V")
-        self._spin_dur    = _spin_esc(5.0, 300.0, 15.0, 5.0, 0, " s")
+        self._spin_v_ini = _spin(0.0,  30.0,  6.0,  0.5, 1, " V")
+        self._spin_v_fin = _spin(0.0,  30.0, 24.0,  0.5, 1, " V")
+        self._spin_paso  = _spin(0.5,  10.0,  1.0,  0.5, 1, " V")
+        self._spin_dur   = _spin(5.0, 300.0, 10.0,  5.0, 0, " s")
 
-        v.addLayout(_row_param("V inicio:", self._spin_v_ini))
-        v.addLayout(_row_param("V final:",  self._spin_v_fin))
-        v.addLayout(_row_param("Paso V:",   self._spin_paso))
-        v.addLayout(_row_param("Duración:", self._spin_dur))
+        g = QGridLayout(); g.setSpacing(4)
+        g.addLayout(_col("V inicio", self._spin_v_ini), 0, 0)
+        g.addLayout(_col("V final",  self._spin_v_fin), 0, 1)
+        g.addLayout(_col("Paso V",   self._spin_paso),  1, 0)
+        g.addLayout(_col("Duración", self._spin_dur),   1, 1)
+        v.addLayout(g)
 
-        # Botón Iniciar / Detener
+        self._btn_esc_style_ini = f"""QPushButton {{
+            background-color:#0D419D; color:white;
+            border:none; border-radius:5px;
+            font-size:11px; font-weight:bold;
+        }} QPushButton:hover {{ background-color:#1158C7; }}"""
+        self._btn_esc_style_det = f"""QPushButton {{
+            background-color:#3D1515; color:#FF7B72;
+            border:1px solid #FF7B72; border-radius:5px;
+            font-size:11px; font-weight:bold;
+        }} QPushButton:hover {{ background-color:#5C1F1F; }}"""
         self._btn_esc = QPushButton("▶  Iniciar Escalones")
-        self._btn_esc.setCheckable(True)
-        self._btn_esc.setFixedHeight(34)
-        self._btn_esc_style_ini = f"""
-            QPushButton {{
-                background-color:#0D419D; color:white;
-                border:none; border-radius:5px;
-                font-size:11px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background-color:#1158C7; }}
-        """
-        self._btn_esc_style_det = f"""
-            QPushButton {{
-                background-color:#3D1515; color:#FF7B72;
-                border:1px solid #FF7B72; border-radius:5px;
-                font-size:11px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background-color:#5C1F1F; }}
-        """
+        self._btn_esc.setCheckable(True); self._btn_esc.setFixedHeight(30)
         self._btn_esc.setStyleSheet(self._btn_esc_style_ini)
         self._btn_esc.toggled.connect(self._toggle_escalones)
         v.addWidget(self._btn_esc)
 
-        # Label de estado del escalón
         self._lbl_esc_estado = QLabel("Sin iniciar")
         self._lbl_esc_estado.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_esc_estado.setWordWrap(True)
-        self._lbl_esc_estado.setStyleSheet(
-            f"font-size:10px; color:{_SEC}; padding:2px;"
-        )
+        self._lbl_esc_estado.setStyleSheet(f"font-size:10px; color:{_SEC};")
         v.addWidget(self._lbl_esc_estado)
-
         v.addWidget(_sep())
 
-        # Capturar punto
-        btn_cap = QPushButton("📌  Capturar Punto")
-        btn_cap.setFixedHeight(40)
-        btn_cap.setStyleSheet(f"""
-            QPushButton {{
-                background-color:{_GREEN}; color:white; border:none;
-                border-radius:6px; font-size:12px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background-color:{_GREEN_H}; }}
-        """)
-        btn_cap.clicked.connect(
-            lambda: threading.Thread(
-                target=_capturar_punto_estable, daemon=True
-            ).start()
-        )
-        v.addWidget(btn_cap)
-
-        self._lbl_puntos = QLabel("Puntos capturados: 0")
-        self._lbl_puntos.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_puntos.setStyleSheet(f"font-size:11px; color:{_SEC};")
-        v.addWidget(self._lbl_puntos)
-
+        # ── Curvas Teóricas P1 ─────────────────────────────────
+        lbl_ct = QLabel("Curvas Teóricas · Prueba 1")
+        lbl_ct.setStyleSheet("font-size:11px; font-weight:bold; color:#58A6FF;")
+        v.addWidget(lbl_ct)
+        self._btn_teo_n, self._lbl_teo_n = self._bloque_csv_ui(
+            "n(t) teórico", self._importar_csv_teo_n, v)
+        self._btn_teo_v, self._lbl_teo_v = self._bloque_csv_ui(
+            "V(t) teórico", self._importar_csv_teo_v, v)
         v.addWidget(_sep())
 
-        # Exportar CSV
-        btn_exp = QPushButton("💾  Exportar CSV")
-        btn_exp.setFixedHeight(38)
-        btn_exp.setStyleSheet(f"""
-            QPushButton {{
-                background-color:#21262D; color:{_PRI}; border:1px solid {_BORDER};
-                border-radius:6px; font-size:12px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background-color:#30363D; }}
-        """)
-        btn_exp.clicked.connect(self._exportar)
-        v.addWidget(btn_exp)
+        bv = self._btn_nav("←  Cambiar Prueba", _SEC, "#21262D", _BORDER, "#30363D")
+        bv.clicked.connect(self._volver_menu); v.addWidget(bv)
+        bf = self._btn_nav("⏹  Finalizar", "#FF7B72", "#3D1515", "#6A1C1C", "#5C1F1F")
+        bf.clicked.connect(self._finalizar);  v.addWidget(bf)
+        v.addStretch()
+        return panel
 
-        # Finalizar ensayo
-        btn_fin = QPushButton("⏹  Finalizar")
-        btn_fin.setFixedHeight(38)
-        btn_fin.setStyleSheet(f"""
-            QPushButton {{
-                background-color:#3D1515; color:#FF7B72; border:1px solid #6A1C1C;
-                border-radius:6px; font-size:12px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background-color:#5C1F1F; }}
-        """)
-        btn_fin.clicked.connect(self._finalizar)
-        v.addWidget(btn_fin)
+    # ─────────────────────────────────────────────────────────────
+    #  Panel Prueba 2: Variables · Fuente · CSV P2
+    # ─────────────────────────────────────────────────────────────
+    def _hacer_panel_p2(self) -> QFrame:
+        panel = QFrame(); panel.setObjectName("panel_p2")
+        v = QVBoxLayout(panel); v.setSpacing(5); v.setContentsMargins(10, 10, 10, 10)
 
+        self._seccion_vars(v, "_lbl_vars_p2")
+        self._seccion_fuente(v, "_spin_volt_p2", "_btn_outp_p2")
+
+        # ── Curvas Teóricas P2 ─────────────────────────────────
+        lbl_ct = QLabel("Curvas Teóricas · Prueba 2")
+        lbl_ct.setStyleSheet("font-size:11px; font-weight:bold; color:#58A6FF;")
+        v.addWidget(lbl_ct)
+        self._btn_teo_p2_w,  self._lbl_teo_p2_w  = self._bloque_csv_ui(
+            "n(TL) teórico",  self._importar_csv_p2_w,  v)
+        self._btn_teo_p2_i,  self._lbl_teo_p2_i  = self._bloque_csv_ui(
+            "I(TL) teórico",  self._importar_csv_p2_i,  v)
+        self._btn_teo_p2_pm, self._lbl_teo_p2_pm = self._bloque_csv_ui(
+            "Pm(TL) teórico", self._importar_csv_p2_pm, v)
+        self._btn_teo_p2_n,  self._lbl_teo_p2_n  = self._bloque_csv_ui(
+            "η(TL) teórico",  self._importar_csv_p2_n,  v)
+        v.addWidget(_sep())
+
+        bv = self._btn_nav("←  Cambiar Prueba", _SEC, "#21262D", _BORDER, "#30363D")
+        bv.clicked.connect(self._volver_menu); v.addWidget(bv)
+        bf = self._btn_nav("⏹  Finalizar", "#FF7B72", "#3D1515", "#6A1C1C", "#5C1F1F")
+        bf.clicked.connect(self._finalizar);  v.addWidget(bf)
         v.addStretch()
         return panel
 
@@ -1242,7 +1304,7 @@ class _PantallaGraficas(QWidget):
         """Ajusta títulos y curvas según la prueba activa."""
         if prueba == "prueba1":
             # Gráfica top: n(t) [RPM]
-            self._plot_top.setTitle("Velocidad Angular vs Tiempo",
+            self._plot_top.setTitle("Velocidad (RPM) vs Tiempo",
                                     color="#C9D1D9", size="12pt")
             self._plot_top.setLabel("left",   "Velocidad (RPM)", color=_SEC)
             self._plot_top.setLabel("bottom", "Tiempo (s)",      color=_SEC)
@@ -1288,12 +1350,15 @@ class _PantallaGraficas(QWidget):
             w_r = list(_w_buf)
 
         # Actualizar curvas según prueba
-        self._curva_top.setData(t, n)
         if self._prueba == "prueba1":
+            self._curva_top.setData(t, n)
             self._curva_bot.setData(t, V)
         else:
-            self._curva_bot.setData(t, TL)
-            self._curva_bot2.setData(t, eta)
+            # Prueba 2: 4 gráficas vs TL
+            self._p2_c_w.setData(TL, n)      # n (RPM) vs TL
+            self._p2_c_i.setData(TL, I)
+            self._p2_c_pm.setData(TL, Pm)
+            self._p2_c_n.setData(TL, eta)    # η (%) vs TL
 
         # Panel de variables
         vals = {
@@ -1307,20 +1372,11 @@ class _PantallaGraficas(QWidget):
             "Pm": f"{Pm[-1]:.5f}",
             "η":  f"{eta[-1]:.2f}",
         }
-        for sym, lbl in self._lbl_vars.items():
-            lbl.setText(vals.get(sym, "—"))
+        for d in (self._lbl_vars_p1, self._lbl_vars_p2):
+            for sym, lbl in d.items():
+                lbl.setText(vals.get(sym, "—"))
 
     # ── exportación ───────────────────────────────────────────
-    def _toggle_output(self, checked: bool):
-        """Enciende/apaga salida CH1 y actualiza estilo del botón."""
-        _set_output(checked)
-        if checked:
-            self._btn_outp.setText("⚡  Salida ON")
-            self._btn_outp.setStyleSheet(self._btn_outp_style_on)
-        else:
-            self._btn_outp.setText("○  Salida OFF")
-            self._btn_outp.setStyleSheet(self._btn_outp_style_off)
-
     def _toggle_escalones(self, checked: bool):
         if checked:
             self._btn_esc.setText("⏹  Detener")
@@ -1379,18 +1435,103 @@ class _PantallaGraficas(QWidget):
                 ),
             )
 
-    def _finalizar(self):
-        resp = QMessageBox.question(
-            self,
-            "Finalizar ensayo",
-            "¿Desea exportar los datos antes de finalizar?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            | QMessageBox.StandardButton.Cancel,
+    # ── Importar CSVs teóricos ────────────────────────────────
+    def _importar_csv_teo(self, tipo: str):
+        """Lee un CSV de dos columnas (tiempo, valor) y lo grafica como curva teórica."""
+        titulo = "n(t) teórico — RPM" if tipo == "n" else "V(t) teórico — Voltaje"
+        ruta, _ = QFileDialog.getOpenFileName(
+            self, f"Importar {titulo}", "", "CSV (*.csv);;Todos (*)"
         )
-        if resp == QMessageBox.StandardButton.Cancel:
+        if not ruta:
             return
-        if resp == QMessageBox.StandardButton.Yes:
-            self._exportar()
+        try:
+            t_teo, y_teo = [], []
+            with open(ruta, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for i, row in enumerate(reader):
+                    if len(row) < 2:
+                        continue
+                    try:
+                        t_teo.append(float(row[0]))
+                        y_teo.append(float(row[1]))
+                    except ValueError:
+                        continue   # salta encabezado u otras filas no numéricas
+
+            nombre = os.path.basename(ruta)
+            _sty_ok = "font-size:9px; color:#7EE787; padding-left:12px;"
+            if tipo == "n":
+                self._curva_top_teo.setData(t_teo, y_teo)
+                self._lbl_teo_n.setText(f"✓ {nombre}")
+                self._lbl_teo_n.setStyleSheet(_sty_ok)
+                self._lbl_teo_n.setToolTip(nombre)
+            else:
+                self._curva_bot_teo.setData(t_teo, y_teo)
+                self._lbl_teo_v.setText(f"✓ {nombre}")
+                self._lbl_teo_v.setStyleSheet(_sty_ok)
+                self._lbl_teo_v.setToolTip(nombre)
+
+            señales.conexion_msg.emit(f"CSV teórico cargado: {nombre}")
+        except Exception as e:
+            señales.conexion_msg.emit(f"Error al leer CSV teórico: {e}")
+
+    def _importar_csv_teo_n(self):
+        self._importar_csv_teo("n")
+
+    def _importar_csv_teo_v(self):
+        self._importar_csv_teo("V")
+
+    # ── Importar CSVs teóricos Prueba 2 (vs TL) ──────────────
+    def _importar_csv_p2(self, curva, lbl_attr: str, titulo: str):
+        ruta, _ = QFileDialog.getOpenFileName(
+            self, f"Importar {titulo} teórico", "", "CSV (*.csv);;Todos (*)"
+        )
+        if not ruta:
+            return
+        try:
+            x, y = [], []
+            with open(ruta, newline="", encoding="utf-8") as f:
+                for row in csv.reader(f):
+                    if len(row) < 2:
+                        continue
+                    try:
+                        x.append(float(row[0])); y.append(float(row[1]))
+                    except ValueError:
+                        continue
+            curva.setData(x, y)
+            nombre = os.path.basename(ruta)
+            lbl = getattr(self, lbl_attr)
+            lbl.setText(f"✓ {nombre}")
+            lbl.setStyleSheet("font-size:9px; color:#7EE787; padding-left:12px;")
+            lbl.setToolTip(nombre)
+            señales.conexion_msg.emit(f"CSV teórico cargado: {nombre}")
+        except Exception as e:
+            señales.conexion_msg.emit(f"Error CSV teórico: {e}")
+
+    def _importar_csv_p2_w(self):
+        self._importar_csv_p2(self._p2_ct_w,  "_lbl_teo_p2_w",  "n(TL)")
+
+    def _importar_csv_p2_i(self):
+        self._importar_csv_p2(self._p2_ct_i,  "_lbl_teo_p2_i",  "I(TL)")
+
+    def _importar_csv_p2_pm(self):
+        self._importar_csv_p2(self._p2_ct_pm, "_lbl_teo_p2_pm", "Pm(TL)")
+
+    def _importar_csv_p2_n(self):
+        self._importar_csv_p2(self._p2_ct_n,  "_lbl_teo_p2_n",  "η(TL)")
+
+    def _volver_menu(self):
+        """Detiene escalones activos y vuelve a la pantalla de selección de prueba."""
+        _escalon_stop.set()
+        if self._volver_cb:
+            self._volver_cb()
+
+    def _finalizar(self):
+        """Apaga la fuente, detiene todo y cierra la ventana."""
+        _escalon_stop.set()
+        _set_voltaje(0.0)
+        _set_output(False)
+        from PyQt6.QtWidgets import QApplication
+        QApplication.quit()
 
 
 # ============================================================
@@ -1409,7 +1550,7 @@ class VentanaPrincipal(QMainWindow):
         self._p0 = _PantallaBienvenida(lambda: self._ir(1))
         self._p1 = _PantallaConfig(lambda: self._ir(2))
         self._p2 = _PantallaPrueba(self._iniciar_ensayo)
-        self._p3 = _PantallaGraficas()
+        self._p3 = _PantallaGraficas(volver_cb=lambda: self._ir(2))
 
         for p in (self._p0, self._p1, self._p2, self._p3):
             self._stack.addWidget(p)
@@ -1420,6 +1561,14 @@ class VentanaPrincipal(QMainWindow):
         self._stack.setCurrentIndex(idx)
 
     def _iniciar_ensayo(self, prueba: str):
+        # Limpiar buffers para no mezclar datos de pruebas anteriores
+        with _lock:
+            for buf in (_t_buf, _n_buf, _w_buf, _FL_buf, _TL_buf,
+                        _V_buf, _I_buf, _Pe_buf, _Pm_buf, _eta_buf):
+                buf.clear()
+            _registros.clear()
+            _puntos_op.clear()
+
         self._p3.set_prueba(prueba)
         self._p3._configurar_graficas(prueba)
         self._ir(3)
