@@ -9,7 +9,7 @@
 #
 #  Versión sin fuente programable:
 #    - V = 0, I = 0  (no disponibles)
-#    - Prueba 1: gráfica n(t) + TL(t)
+#    - Prueba 1: gráfica n(t) + V(t)
 #    - Prueba 2: captura por promedio de 10 s
 #
 #  Pantallas:
@@ -882,6 +882,17 @@ class _PantallaGraficas(QWidget):
         self._prueba        = "prueba1"
         self._volver_cb     = volver_cb
         self._ensayo_activo = False
+
+        # Datos teóricos cargados desde CSV.
+        # Se inicializan explícitamente para que el estado sea consistente
+        # al cambiar entre pruebas.
+        self._teo_n_data     = ([], [])
+        self._teo_v_data     = ([], [])
+        self._teo_p2_w_data  = ([], [])
+        self._teo_p2_i_data  = ([], [])
+        self._teo_p2_pm_data = ([], [])
+        self._teo_p2_n_data  = ([], [])
+
         self._construir()
 
     def set_prueba(self, prueba: str):
@@ -892,6 +903,13 @@ class _PantallaGraficas(QWidget):
             "prueba2": "Prueba 2 · Caracterización con Freno",
         }
         self._lbl_titulo.setText(nombres.get(prueba, "Ensayo"))
+
+        # Si se vuelve al menú con una medición activa, los botones pueden
+        # conservar su estado checked. Se fuerzan a "detenido" para que al
+        # regresar el siguiente clic siempre signifique INICIAR.
+        for btn in (self._btn_p1_med, self._btn_p2_med):
+            if btn.isChecked():
+                btn.setChecked(False)
 
         es_p1 = (prueba == "prueba1")
         self._panel_stack.setCurrentIndex(0 if es_p1 else 1)
@@ -1124,7 +1142,7 @@ class _PantallaGraficas(QWidget):
         self._btn_teo_n, self._lbl_teo_n = self._bloque_csv_ui(
             "n(t) teórico", self._importar_csv_teo_n, v)
         self._btn_teo_v, self._lbl_teo_v = self._bloque_csv_ui(
-            "TL(t) teórico", self._importar_csv_teo_v, v)
+            "V(t) teórico", self._importar_csv_teo_v, v)
         v.addWidget(_sep())
 
         bv = self._btn_nav("←  Cambiar Prueba", _SEC, "#21262D", _BORDER, "#30363D")
@@ -1167,7 +1185,11 @@ class _PantallaGraficas(QWidget):
                                   s_ini=sty_ini2, s_det=sty_det2):
             if checked:
                 self._ensayo_activo = True
+
+                # Mostrar las curvas teóricas JUSTO al iniciar la medición,
+                # igual que en la Prueba 1.
                 self._mostrar_teo_p2()
+
                 b.setText("⏹  Detener"); b.setStyleSheet(s_det)
             else:
                 self._ensayo_activo = False
@@ -1324,12 +1346,12 @@ class _PantallaGraficas(QWidget):
             self._plot_top.setLabel("bottom", "Tiempo (s)",      color=_SEC)
             self._curva_top.setPen(pg.mkPen(color=_CYAN, width=2.2))
             self._curva_top2.setPen(pg.mkPen(color="transparent"))
-            # Gráfica bot: TL(t)  (sin fuente no tenemos V)
-            self._plot_bot.setTitle("Torque de Carga vs Tiempo",
+            # Gráfica bot: V(t)
+            self._plot_bot.setTitle("Voltaje vs Tiempo",
                                     color="#C9D1D9", size="12pt")
-            self._plot_bot.setLabel("left",   "Torque (N·m)", color=_SEC)
-            self._plot_bot.setLabel("bottom", "Tiempo (s)",   color=_SEC)
-            self._curva_bot.setPen(pg.mkPen(color=_RED_C, width=2.2))
+            self._plot_bot.setLabel("left",   "Voltaje (V)", color=_SEC)
+            self._plot_bot.setLabel("bottom", "Tiempo (s)",  color=_SEC)
+            self._curva_bot.setPen(pg.mkPen(color=_YELLOW, width=2.2))
             self._curva_bot2.setPen(pg.mkPen(color="transparent"))
         else:
             # Gráfica top: n(t) + TL(t) con dos ejes
@@ -1368,7 +1390,7 @@ class _PantallaGraficas(QWidget):
         # Actualizar curvas según prueba
         if self._prueba == "prueba1":
             self._curva_top.setData(t, n)
-            self._curva_bot.setData(t, TL)   # TL(t) — sin fuente no hay V
+            self._curva_bot.setData(t, V)    # V(t)
         # Prueba 2: los gráficos solo se actualizan al capturar un punto
 
         # Panel de variables
@@ -1427,25 +1449,100 @@ class _PantallaGraficas(QWidget):
             )
 
     # ── Importar CSVs teóricos ────────────────────────────────
+    @staticmethod
+    def _leer_csv_xy(ruta: str) -> tuple[list[float], list[float]]:
+        """
+        Lee un CSV de dos columnas y retorna (x, y).
+
+        Acepta automáticamente:
+          - punto y coma:  x;y
+          - coma:          x,y
+          - tabulador:     x\ty
+
+        Las filas de encabezado se ignoran automáticamente.
+        Esto es importante para los CSV de la Prueba 2, cuyo formato
+        esperado es, por ejemplo:
+
+            load torque;speed
+            0.0000;3980
+            0.0100;3650
+        """
+        with open(ruta, "r", newline="", encoding="utf-8-sig") as f:
+            contenido = f.read()
+
+        if not contenido.strip():
+            raise ValueError("El archivo CSV está vacío.")
+
+        # Detectar separador. Priorizamos ';' porque los CSV de torque
+        # del proyecto usan el formato: load torque;variable
+        primera_linea = next(
+            (ln for ln in contenido.splitlines() if ln.strip()),
+            ""
+        )
+
+        if ";" in primera_linea:
+            delimitador = ";"
+        elif "\t" in primera_linea:
+            delimitador = "\t"
+        elif "," in primera_linea:
+            delimitador = ","
+        else:
+            # Intento adicional con Sniffer para archivos menos comunes.
+            try:
+                delimitador = csv.Sniffer().sniff(
+                    contenido[:4096], delimiters=";,\t"
+                ).delimiter
+            except csv.Error as e:
+                raise ValueError(
+                    "No se pudo detectar el separador del CSV. "
+                    "Usa dos columnas separadas por ';', ',' o tabulador."
+                ) from e
+
+        x: list[float] = []
+        y: list[float] = []
+
+        lector = csv.reader(contenido.splitlines(), delimiter=delimitador)
+        for row in lector:
+            if len(row) < 2:
+                continue
+
+            sx = row[0].strip()
+            sy = row[1].strip()
+
+            # Para archivos separados por ';' se admite también coma decimal.
+            if delimitador == ";":
+                sx = sx.replace(",", ".")
+                sy = sy.replace(",", ".")
+
+            try:
+                xv = float(sx)
+                yv = float(sy)
+            except ValueError:
+                # Encabezados como "load torque;speed" caen aquí y se ignoran.
+                continue
+
+            if math.isfinite(xv) and math.isfinite(yv):
+                x.append(xv)
+                y.append(yv)
+
+        if not x:
+            raise ValueError(
+                "No se encontraron pares numéricos en las dos primeras columnas. "
+                "Verifica que el archivo tenga formato 'x;variable'."
+            )
+
+        return x, y
+
     def _importar_csv_teo(self, tipo: str):
         """Lee un CSV (tiempo, valor) y guarda los datos; NO los grafica hasta iniciar ensayo."""
-        titulo = "n(t) teórico — RPM" if tipo == "n" else "TL(t) teórico — Torque"
+        titulo = "n(t) teórico — RPM" if tipo == "n" else "V(t) teórico — Voltaje"
         ruta, _ = QFileDialog.getOpenFileName(
             self, f"Importar {titulo}", "", "CSV (*.csv);;Todos (*)"
         )
         if not ruta:
             return
         try:
-            t_teo, y_teo = [], []
-            with open(ruta, newline="", encoding="utf-8") as f:
-                for row in csv.reader(f):
-                    if len(row) < 2:
-                        continue
-                    try:
-                        t_teo.append(float(row[0]))
-                        y_teo.append(float(row[1]))
-                    except ValueError:
-                        continue
+            t_teo, y_teo = self._leer_csv_xy(ruta)
 
             nombre = os.path.basename(ruta)
             _sty_ok = "font-size:9px; color:#7EE787; padding-left:12px;"
@@ -1478,16 +1575,32 @@ class _PantallaGraficas(QWidget):
             self._curva_bot_teo.setData(*self._teo_v_data)
 
     def _mostrar_teo_p2(self):
-        """Grafica las curvas teóricas de P2 si están cargadas."""
+        """Grafica las curvas teóricas de P2 cargadas y ajusta la vista."""
         _map = [
-            ("_teo_p2_w_data",  self._p2_ct_w),
-            ("_teo_p2_i_data",  self._p2_ct_i),
-            ("_teo_p2_pm_data", self._p2_ct_pm),
-            ("_teo_p2_n_data",  self._p2_ct_n),
+            ("_teo_p2_w_data",  self._p2_ct_w,  self._p2_plot_w),
+            ("_teo_p2_i_data",  self._p2_ct_i,  self._p2_plot_i),
+            ("_teo_p2_pm_data", self._p2_ct_pm, self._p2_plot_pm),
+            ("_teo_p2_n_data",  self._p2_ct_n,  self._p2_plot_n),
         ]
-        for attr, curva in _map:
-            if hasattr(self, attr) and getattr(self, attr):
-                curva.setData(*getattr(self, attr))
+
+        graficas_con_datos = []
+
+        for attr, curva, plot in _map:
+            datos = getattr(self, attr, ([], []))
+            x, y = datos
+
+            if x and y:
+                curva.setData(x, y)
+                graficas_con_datos.append(plot)
+            else:
+                curva.setData([], [])
+
+        # Forzar actualización y autoescala. De esta manera las curvas
+        # aparecen inmediatamente al pulsar "Iniciar Medición", igual que P1.
+        for plot in graficas_con_datos:
+            plot.enableAutoRange(axis="x", enable=True)
+            plot.enableAutoRange(axis="y", enable=True)
+            plot.autoRange()
 
     # ── Importar CSVs teóricos Prueba 2 (vs TL) ──────────────
     def _importar_csv_p2(self, data_attr: str, lbl_attr: str, titulo: str):
@@ -1498,22 +1611,14 @@ class _PantallaGraficas(QWidget):
         if not ruta:
             return
         try:
-            x, y = [], []
-            with open(ruta, newline="", encoding="utf-8") as f:
-                for row in csv.reader(f):
-                    if len(row) < 2:
-                        continue
-                    try:
-                        x.append(float(row[0])); y.append(float(row[1]))
-                    except ValueError:
-                        continue
+            x, y = self._leer_csv_xy(ruta)
             setattr(self, data_attr, (x, y))   # guardado, no graficado aún
             nombre = os.path.basename(ruta)
             lbl = getattr(self, lbl_attr)
             lbl.setText(f"✓ {nombre}")
             lbl.setStyleSheet("font-size:9px; color:#7EE787; padding-left:12px;")
             lbl.setToolTip(nombre)
-            señales.conexion_msg.emit(f"CSV teórico listo (se graficará al aplicar): {nombre}")
+            señales.conexion_msg.emit(f"CSV teórico listo (se graficará al iniciar medición): {nombre}")
         except Exception as e:
             señales.conexion_msg.emit(f"Error CSV teórico: {e}")
 
@@ -1552,7 +1657,7 @@ class VentanaPrincipal(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Dashboard — Freno Magnético Motor 57BLDC")
+        self.setWindowTitle("Dashboard — Freno Magnético Motor 57BLDC · P1 VOLTAJE")
         self.resize(1380, 900)
 
         self._stack = QStackedWidget()
