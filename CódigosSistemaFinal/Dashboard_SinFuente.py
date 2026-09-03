@@ -1,11 +1,16 @@
 # ============================================================
-#  Dashboard — Sistema de Monitoreo
+#  Dashboard — Sistema de Monitoreo  (SIN FUENTE KEYSIGHT)
 #  Freno Magnético · Motor 57BLDC
 #
 #  Autores:
 #    Juan Andrés Sanchez
 #    Sofía Vega
 #    Andrés Felipe Trujillo
+#
+#  Versión sin fuente programable:
+#    - V = 0, I = 0  (no disponibles)
+#    - Prueba 1: gráfica n(t) + TL(t)
+#    - Prueba 2: captura por promedio de 10 s
 #
 #  Pantallas:
 #    0 · Bienvenida
@@ -55,12 +60,6 @@ TOPIC_CMD       = "micro1/motor1/cmd"
 SERIAL_BAUD = 115200
 
 # ============================================================
-#  FUENTE PROGRAMABLE KEYSIGHT  —  PyVISA  (Canal 1)
-# ============================================================
-VISA_ADDRESS    = "USB0::0x2A8D::0x3302::MY61004672::0::INSTR"
-FUENTE_INTERVAL = 0.5   # segundos entre lecturas
-
-# ============================================================
 #  PARAMETROS DE ADQUISICION
 # ============================================================
 MAX_POINTS           = 600   # puntos en memoria para graficar
@@ -105,12 +104,8 @@ _ultimo_torque_v = 0.0
 # Tiempos
 _inicio_tiempo = time.time()
 
-# Valores actuales de la fuente (actualizados por hilo PyVISA)
-_V_fuente    = 0.0
-_fuente_inst = None   # handle pyvisa.Resource compartido con controles GUI
-
-# Prueba de escalones de voltaje
-_escalon_stop = threading.Event()   # set() para detener la secuencia
+# Prueba de escalones de voltaje (no usada sin fuente, pero se conserva el Event)
+_escalon_stop = threading.Event()
 
 # Captura de puntos Prueba 2
 _p2_puntos: list[dict] = []          # cada entrada: {TL, n, I, Pm, eta}
@@ -118,8 +113,6 @@ _captura_p2_stop = threading.Event() # set() para cancelar captura activa
 
 # Confirmación de tara desde ESP32
 _tara_ok_event = threading.Event()  # set() cuando llega {"status":"tara_ok"}
-_I_fuente = 0.0
-
 # Tipo de prueba activa ("prueba1" | "prueba2")
 _prueba_activa: str = "prueba1"
 
@@ -159,7 +152,7 @@ def _calcular_derivadas(n_rpm: float, TL_Nm: float, V: float, I: float):
 #  PROCESAMIENTO DE DATOS  (ESP32 → buffer compartido)
 # ============================================================
 def _procesar(data: dict):
-    global _ultima_rpm_ref, _ultimo_torque_v, _V_fuente, _I_fuente
+    global _ultima_rpm_ref, _ultimo_torque_v
 
     n_rpm     = float(data.get("rpm_final",  0))
     torq_raw  = float(data.get("torque_Nm",  0))
@@ -176,9 +169,9 @@ def _procesar(data: dict):
 
     TL = _ultimo_torque_v
 
-    # Variables de la fuente (leídas en otro hilo)
-    V = _V_fuente
-    I = _I_fuente
+    # Sin fuente: V e I no disponibles
+    V = 0.0
+    I = 0.0
 
     omega, Pe, Pm, eta = _calcular_derivadas(n_rpm, TL, V, I)
 
@@ -223,112 +216,6 @@ def _procesar(data: dict):
     señales.datos_nuevos.emit()
 
 
-# ============================================================
-#  FUENTE KEYSIGHT — PyVISA  (hilo background)
-# ============================================================
-def _leer_fuente_loop():
-    """
-    Lee V e I del canal 1 de la fuente Keysight en loop.
-    Guarda el handle en _fuente_inst para que la GUI pueda enviar comandos.
-    """
-    global _V_fuente, _I_fuente, _fuente_inst
-    try:
-        import pyvisa  # type: ignore
-        rm   = pyvisa.ResourceManager()
-        inst = rm.open_resource(VISA_ADDRESS)
-        inst.timeout           = 5000
-        inst.write_termination = "\n"
-        inst.read_termination  = "\n"
-
-        # Seleccionar CH1, fijar voltaje a 0 y encender salida
-        inst.write("INST:SEL CH1")
-        inst.write("VOLT 0")
-        inst.write("OUTP ON")
-
-        _fuente_inst = inst   # exponer handle para controles GUI
-
-        señales.conexion_msg.emit(
-            f"Fuente Keysight conectada · {inst.query('*IDN?').strip()[:40]}"
-        )
-
-        while True:
-            try:
-                _V_fuente = float(inst.query("MEAS:VOLT?").strip())
-                _I_fuente = float(inst.query("MEAS:CURR?").strip())
-            except Exception:
-                pass
-            time.sleep(FUENTE_INTERVAL)
-
-    except Exception as e:
-        señales.conexion_msg.emit(f"PyVISA: {e} (sin fuente, V=0 I=0)")
-
-
-def _set_voltaje(v: float):
-    """Envía VOLT <v> al CH1. Seguro para llamar desde la GUI."""
-    if _fuente_inst is None:
-        return
-    try:
-        _fuente_inst.write(f"VOLT {v:.3f}")
-    except Exception:
-        pass
-
-
-def _set_output(on: bool):
-    """Enciende o apaga la salida CH1."""
-    if _fuente_inst is None:
-        return
-    try:
-        _fuente_inst.write("OUTP ON" if on else "OUTP OFF")
-    except Exception:
-        pass
-
-
-def _run_escalones(v_ini: float, v_fin: float, paso: float, duracion: float):
-    """
-    Hilo background para prueba de escalones de voltaje.
-    Recorre de v_ini a v_fin en pasos de 'paso' voltios,
-    manteniendo cada escalón 'duracion' segundos.
-    Captura un punto estable al final de cada escalón.
-    """
-    _escalon_stop.clear()
-
-    import math as _math
-    n_pasos = max(1, round((_math.fabs(v_fin - v_ini)) / paso) + 1)
-    signo   = 1.0 if v_fin >= v_ini else -1.0
-    voltajes = [round(v_ini + signo * paso * i, 3) for i in range(n_pasos)]
-    # Asegurar que el último valor sea exactamente v_fin
-    voltajes[-1] = v_fin
-
-    total = len(voltajes)
-    for idx, v in enumerate(voltajes, start=1):
-        if _escalon_stop.is_set():
-            señales.escalon_progreso.emit("Detenido por el usuario")
-            _set_voltaje(0.0)
-            return
-
-        _set_voltaje(v)
-        señales.escalon_progreso.emit(
-            f"Escalón {idx}/{total} · {v:.1f} V"
-        )
-
-        # Esperar duracion segundos o hasta que se detenga, con cuenta regresiva
-        t_fin = time.time() + duracion
-        while time.time() < t_fin:
-            if _escalon_stop.is_set():
-                señales.escalon_progreso.emit("Detenido por el usuario")
-                _set_voltaje(0.0)
-                return
-            restante = int(t_fin - time.time()) + 1
-            señales.escalon_progreso.emit(
-                f"Escalón {idx}/{total} · {v:.1f} V · {restante}s"
-            )
-            time.sleep(0.5)
-
-        # Capturar punto al final del escalón
-        _capturar_punto_estable()
-
-    _set_voltaje(0.0)
-    señales.escalon_progreso.emit(f"Completado · {total} escalones")
 
 
 # ============================================================
@@ -863,9 +750,6 @@ class _PantallaConfig(QWidget):
         self._lbl_estado.setText("Sistema listo para medir.")
         self._btn_go.setEnabled(True)
 
-        # Iniciar hilo de lectura de fuente Keysight (no bloqueante si no está disponible)
-        threading.Thread(target=_leer_fuente_loop, daemon=True).start()
-
     def _cal_timeout(self):
         """La ESP32 no confirmó la tara en el tiempo esperado."""
         self._btn_cal.setText("⚠  Reintentar Calibración")
@@ -1146,74 +1030,8 @@ class _PantallaGraficas(QWidget):
         setattr(self, lbl_dict_attr, d)
         v.addWidget(_sep())
 
-    def _seccion_fuente(self, v: QVBoxLayout, spin_attr: str, outp_attr: str):
-        """Añade control fuente CH1 al layout v."""
-        lbl_f = QLabel("Control Fuente · CH1")
-        lbl_f.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_YELLOW};")
-        v.addWidget(lbl_f)
-
-        spin = QDoubleSpinBox()
-        spin.setRange(0.0, 30.0); spin.setSingleStep(0.5)
-        spin.setDecimals(1); spin.setSuffix(" V"); spin.setValue(0.0)
-        spin.setFixedHeight(28)
-        spin.setStyleSheet(f"""
-            QDoubleSpinBox {{
-                background:#21262D; color:{_PRI};
-                border:1px solid {_BORDER}; border-radius:5px;
-                font-size:12px; padding:1px 5px;
-            }}
-            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
-                width:16px; background:#30363D; border:none;
-            }}
-        """)
-        setattr(self, spin_attr, spin)
-
-        btn_ap = QPushButton("Aplicar")
-        btn_ap.setFixedHeight(28)
-        btn_ap.setStyleSheet(f"""
-            QPushButton {{
-                background-color:{_YELLOW}; color:#0D1117;
-                border:none; border-radius:5px;
-                font-size:11px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background-color:#E3C000; }}
-        """)
-        def _on_aplicar():
-            _set_voltaje(getattr(self, spin_attr).value())
-            self._ensayo_activo = True
-            if spin_attr == "_spin_volt":
-                self._mostrar_teo_p1()
-            else:
-                self._mostrar_teo_p2()
-        btn_ap.clicked.connect(_on_aplicar)
-        row_f = QHBoxLayout(); row_f.setSpacing(6)
-        row_f.addWidget(spin, stretch=1); row_f.addWidget(btn_ap)
-        v.addLayout(row_f)
-
-        sty_on  = f"""QPushButton {{
-            background-color:#1A4D2E; color:#39D353;
-            border:1px solid #39D353; border-radius:5px;
-            font-size:11px; font-weight:bold;
-            padding-top:2px; padding-bottom:6px;
-        }} QPushButton:hover {{ background-color:#245C38; }}"""
-        sty_off = f"""QPushButton {{
-            background-color:#3D1515; color:#FF7B72;
-            border:1px solid #FF7B72; border-radius:5px;
-            font-size:11px; font-weight:bold;
-            padding-top:2px; padding-bottom:6px;
-        }} QPushButton:hover {{ background-color:#5C1F1F; }}"""
-        btn_out = QPushButton("⚡  Salida ON")
-        btn_out.setCheckable(True); btn_out.setChecked(True)
-        btn_out.setFixedHeight(32)
-        btn_out.setStyleSheet(sty_on)
-        def _toggle(checked, b=btn_out, s_on=sty_on, s_off=sty_off):
-            _set_output(checked)
-            b.setText("⚡  Salida ON" if checked else "○  Salida OFF")
-            b.setStyleSheet(s_on if checked else s_off)
-        btn_out.toggled.connect(_toggle)
-        setattr(self, outp_attr, btn_out)
-        v.addWidget(btn_out)
-        v.addWidget(_sep())
+    def _seccion_fuente(self, _v, _sa, _oa):
+        """Sin fuente: método vacío conservado para compatibilidad."""
 
     @staticmethod
     def _bloque_csv_ui(nombre_var: str, slot, parent_layout: QVBoxLayout):
@@ -1253,64 +1071,50 @@ class _PantallaGraficas(QWidget):
         return b
 
     # ─────────────────────────────────────────────────────────────
-    #  Panel Prueba 1: Variables · Fuente · Escalones · CSV P1
+    #  Panel Prueba 1 (sin fuente): Variables · Inicio/Stop · CSV
     # ─────────────────────────────────────────────────────────────
     def _hacer_panel_p1(self) -> QFrame:
         panel = QFrame(); panel.setObjectName("panel_p1")
         v = QVBoxLayout(panel); v.setSpacing(5); v.setContentsMargins(10, 10, 10, 10)
 
         self._seccion_vars(v, "_lbl_vars_p1")
-        self._seccion_fuente(v, "_spin_volt",  "_btn_outp")
 
-        # ── Prueba de Escalones ────────────────────────────────
-        lbl_esc = QLabel("Prueba de Escalones")
-        lbl_esc.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_CYAN};")
-        v.addWidget(lbl_esc)
+        # ── Inicio / Detener medición ──────────────────────────
+        lbl_med = QLabel("Medición")
+        lbl_med.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_CYAN};")
+        v.addWidget(lbl_med)
 
-        sty_s = self._sty_spin_ctrl()
-        def _spin(lo, hi, val, step, dec, suf):
-            s = QDoubleSpinBox()
-            s.setRange(lo, hi); s.setValue(val); s.setSingleStep(step)
-            s.setDecimals(dec); s.setSuffix(suf); s.setFixedHeight(24)
-            s.setStyleSheet(sty_s); return s
-
-        def _col(label, widget):
-            c = QVBoxLayout(); c.setSpacing(1)
-            l = QLabel(label); l.setStyleSheet(f"font-size:9px; color:{_SEC};")
-            c.addWidget(l); c.addWidget(widget); return c
-
-        self._spin_v_ini = _spin(0.0,  30.0,  6.0,  0.5, 1, " V")
-        self._spin_v_fin = _spin(0.0,  30.0, 24.0,  0.5, 1, " V")
-        self._spin_paso  = _spin(0.5,  10.0,  1.0,  0.5, 1, " V")
-        self._spin_dur   = _spin(5.0, 300.0, 10.0,  5.0, 0, " s")
-
-        g = QGridLayout(); g.setSpacing(4)
-        g.addLayout(_col("V inicio", self._spin_v_ini), 0, 0)
-        g.addLayout(_col("V final",  self._spin_v_fin), 0, 1)
-        g.addLayout(_col("Paso V",   self._spin_paso),  1, 0)
-        g.addLayout(_col("Duración", self._spin_dur),   1, 1)
-        v.addLayout(g)
-
-        self._btn_esc_style_ini = f"""QPushButton {{
+        sty_ini = f"""QPushButton {{
             background-color:#0D419D; color:white;
             border:none; border-radius:5px;
             font-size:11px; font-weight:bold;
         }} QPushButton:hover {{ background-color:#1158C7; }}"""
-        self._btn_esc_style_det = f"""QPushButton {{
+        sty_det = f"""QPushButton {{
             background-color:#3D1515; color:#FF7B72;
             border:1px solid #FF7B72; border-radius:5px;
             font-size:11px; font-weight:bold;
         }} QPushButton:hover {{ background-color:#5C1F1F; }}"""
-        self._btn_esc = QPushButton("▶  Iniciar Escalones")
-        self._btn_esc.setCheckable(True); self._btn_esc.setFixedHeight(30)
-        self._btn_esc.setStyleSheet(self._btn_esc_style_ini)
-        self._btn_esc.toggled.connect(self._toggle_escalones)
-        v.addWidget(self._btn_esc)
 
-        self._lbl_esc_estado = QLabel("Sin iniciar")
-        self._lbl_esc_estado.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_esc_estado.setStyleSheet(f"font-size:10px; color:{_SEC};")
-        v.addWidget(self._lbl_esc_estado)
+        self._btn_p1_med = QPushButton("▶  Iniciar Medición")
+        self._btn_p1_med.setCheckable(True); self._btn_p1_med.setFixedHeight(32)
+        self._btn_p1_med.setStyleSheet(sty_ini)
+
+        def _toggle_medicion_p1(checked, b=self._btn_p1_med,
+                                 s_ini=sty_ini, s_det=sty_det):
+            if checked:
+                _resetear_tiempo()
+                self._ensayo_activo = True
+                self._mostrar_teo_p1()
+                for c in (self._curva_top, self._curva_top2,
+                          self._curva_bot, self._curva_bot2):
+                    c.setData([], [])
+                b.setText("⏹  Detener"); b.setStyleSheet(s_det)
+            else:
+                self._ensayo_activo = False
+                b.setText("▶  Iniciar Medición"); b.setStyleSheet(s_ini)
+
+        self._btn_p1_med.toggled.connect(_toggle_medicion_p1)
+        v.addWidget(self._btn_p1_med)
         v.addWidget(_sep())
 
         # ── Curvas Teóricas P1 ─────────────────────────────────
@@ -1320,7 +1124,7 @@ class _PantallaGraficas(QWidget):
         self._btn_teo_n, self._lbl_teo_n = self._bloque_csv_ui(
             "n(t) teórico", self._importar_csv_teo_n, v)
         self._btn_teo_v, self._lbl_teo_v = self._bloque_csv_ui(
-            "V(t) teórico", self._importar_csv_teo_v, v)
+            "TL(t) teórico", self._importar_csv_teo_v, v)
         v.addWidget(_sep())
 
         bv = self._btn_nav("←  Cambiar Prueba", _SEC, "#21262D", _BORDER, "#30363D")
@@ -1331,14 +1135,47 @@ class _PantallaGraficas(QWidget):
         return panel
 
     # ─────────────────────────────────────────────────────────────
-    #  Panel Prueba 2: Variables · Fuente · CSV P2
+    #  Panel Prueba 2 (sin fuente): Variables · CSV P2 · Captura
     # ─────────────────────────────────────────────────────────────
     def _hacer_panel_p2(self) -> QFrame:
         panel = QFrame(); panel.setObjectName("panel_p2")
         v = QVBoxLayout(panel); v.setSpacing(5); v.setContentsMargins(10, 10, 10, 10)
 
         self._seccion_vars(v, "_lbl_vars_p2")
-        self._seccion_fuente(v, "_spin_volt_p2", "_btn_outp_p2")
+
+        # ── Iniciar medición ───────────────────────────────────
+        lbl_med = QLabel("Medición")
+        lbl_med.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_CYAN};")
+        v.addWidget(lbl_med)
+
+        sty_ini2 = f"""QPushButton {{
+            background-color:#0D419D; color:white;
+            border:none; border-radius:5px;
+            font-size:11px; font-weight:bold;
+        }} QPushButton:hover {{ background-color:#1158C7; }}"""
+        sty_det2 = f"""QPushButton {{
+            background-color:#3D1515; color:#FF7B72;
+            border:1px solid #FF7B72; border-radius:5px;
+            font-size:11px; font-weight:bold;
+        }} QPushButton:hover {{ background-color:#5C1F1F; }}"""
+
+        self._btn_p2_med = QPushButton("▶  Iniciar Medición")
+        self._btn_p2_med.setCheckable(True); self._btn_p2_med.setFixedHeight(32)
+        self._btn_p2_med.setStyleSheet(sty_ini2)
+
+        def _toggle_medicion_p2(checked, b=self._btn_p2_med,
+                                  s_ini=sty_ini2, s_det=sty_det2):
+            if checked:
+                self._ensayo_activo = True
+                self._mostrar_teo_p2()
+                b.setText("⏹  Detener"); b.setStyleSheet(s_det)
+            else:
+                self._ensayo_activo = False
+                b.setText("▶  Iniciar Medición"); b.setStyleSheet(s_ini)
+
+        self._btn_p2_med.toggled.connect(_toggle_medicion_p2)
+        v.addWidget(self._btn_p2_med)
+        v.addWidget(_sep())
 
         # ── Curvas Teóricas P2 ─────────────────────────────────
         lbl_ct = QLabel("Curvas Teóricas · Prueba 2")
@@ -1486,13 +1323,13 @@ class _PantallaGraficas(QWidget):
             self._plot_top.setLabel("left",   "Velocidad (RPM)", color=_SEC)
             self._plot_top.setLabel("bottom", "Tiempo (s)",      color=_SEC)
             self._curva_top.setPen(pg.mkPen(color=_CYAN, width=2.2))
-            self._curva_top2.setPen(pg.mkPen(color="transparent"))  # oculta
-            # Gráfica bot: V(t)
-            self._plot_bot.setTitle("Voltaje de Alimentación vs Tiempo",
+            self._curva_top2.setPen(pg.mkPen(color="transparent"))
+            # Gráfica bot: TL(t)  (sin fuente no tenemos V)
+            self._plot_bot.setTitle("Torque de Carga vs Tiempo",
                                     color="#C9D1D9", size="12pt")
-            self._plot_bot.setLabel("left",   "Voltaje (V)",  color=_SEC)
+            self._plot_bot.setLabel("left",   "Torque (N·m)", color=_SEC)
             self._plot_bot.setLabel("bottom", "Tiempo (s)",   color=_SEC)
-            self._curva_bot.setPen(pg.mkPen(color=_YELLOW, width=2.2))
+            self._curva_bot.setPen(pg.mkPen(color=_RED_C, width=2.2))
             self._curva_bot2.setPen(pg.mkPen(color="transparent"))
         else:
             # Gráfica top: n(t) + TL(t) con dos ejes
@@ -1531,7 +1368,7 @@ class _PantallaGraficas(QWidget):
         # Actualizar curvas según prueba
         if self._prueba == "prueba1":
             self._curva_top.setData(t, n)
-            self._curva_bot.setData(t, V)
+            self._curva_bot.setData(t, TL)   # TL(t) — sin fuente no hay V
         # Prueba 2: los gráficos solo se actualizan al capturar un punto
 
         # Panel de variables
@@ -1552,48 +1389,11 @@ class _PantallaGraficas(QWidget):
 
     # ── exportación ───────────────────────────────────────────
     def _toggle_escalones(self, checked: bool):
-        if checked:
-            self._btn_esc.setText("⏹  Detener")
-            self._btn_esc.setStyleSheet(self._btn_esc_style_det)
-
-            v_ini = self._spin_v_ini.value()
-
-            # 1. Limpiar curvas experimentales P1 (las teóricas se conservan)
-            for c in (self._curva_top, self._curva_top2,
-                      self._curva_bot, self._curva_bot2):
-                c.setData([], [])
-
-            # 2. Resetear tiempo y buffers → t=0 al inicio del ensayo
-            _resetear_tiempo()
-
-            # 3. Aplicar V_inicio de forma síncrona antes de arrancar el hilo
-            _set_voltaje(v_ini)
-
-            # 4. Habilitar graficación y mostrar teóricas
-            self._ensayo_activo = True
-            self._mostrar_teo_p1()
-
-            # 5. Arrancar hilo de escalones (empezará desde v_ini)
-            threading.Thread(
-                target=_run_escalones,
-                args=(v_ini,
-                      self._spin_v_fin.value(),
-                      self._spin_paso.value(),
-                      self._spin_dur.value()),
-                daemon=True,
-            ).start()
-        else:
-            _escalon_stop.set()
-            self._btn_esc.setText("▶  Iniciar Escalones")
-            self._btn_esc.setStyleSheet(self._btn_esc_style_ini)
+        """Sin fuente: no hay escalones automáticos."""
+        pass
 
     def _on_escalon_progreso(self, texto: str):
-        self._lbl_esc_estado.setText(texto)
-        # Cuando termina, restablecer botón
-        if texto.startswith("Completado") or texto.startswith("Detenido"):
-            self._btn_esc.setChecked(False)
-            self._btn_esc.setText("▶  Iniciar Escalones")
-            self._btn_esc.setStyleSheet(self._btn_esc_style_ini)
+        pass
 
     def _exportar(self):
         directorio = QFileDialog.getExistingDirectory(
@@ -1629,7 +1429,7 @@ class _PantallaGraficas(QWidget):
     # ── Importar CSVs teóricos ────────────────────────────────
     def _importar_csv_teo(self, tipo: str):
         """Lee un CSV (tiempo, valor) y guarda los datos; NO los grafica hasta iniciar ensayo."""
-        titulo = "n(t) teórico — RPM" if tipo == "n" else "V(t) teórico — Voltaje"
+        titulo = "n(t) teórico — RPM" if tipo == "n" else "TL(t) teórico — Torque"
         ruta, _ = QFileDialog.getOpenFileName(
             self, f"Importar {titulo}", "", "CSV (*.csv);;Todos (*)"
         )
@@ -1730,16 +1530,17 @@ class _PantallaGraficas(QWidget):
         self._importar_csv_p2("_teo_p2_n_data", "_lbl_teo_p2_n",  "η(TL)")
 
     def _volver_menu(self):
-        """Detiene escalones activos y vuelve a la pantalla de selección de prueba."""
+        """Detiene medición activa y vuelve a la pantalla de selección de prueba."""
         _escalon_stop.set()
+        _captura_p2_stop.set()
+        self._ensayo_activo = False
         if self._volver_cb:
             self._volver_cb()
 
     def _finalizar(self):
-        """Apaga la fuente, detiene todo y cierra la ventana."""
+        """Detiene medición y cierra la ventana."""
         _escalon_stop.set()
-        _set_voltaje(0.0)
-        _set_output(False)
+        _captura_p2_stop.set()
         from PyQt6.QtWidgets import QApplication
         QApplication.quit()
 

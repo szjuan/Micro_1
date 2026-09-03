@@ -86,25 +86,14 @@ bool   calibrado = false;   // true solo después de una tara exitosa
 // GEOMETRIA DE LA PALANCA
 // ============================================================
 //
-// Centro iman ---- 6 cm ---- PIVOTE ---- 4 cm ---- GALGA
+// Brazo de reaccion medido experimentalmente:
+// 20 mm = 0.020 m
 //
-// Equilibrio:
-//
-// F_iman * 0.06 = F_galga * 0.04
-//
-// F_iman = F_galga * 0.04 / 0.06
-//
-// Torque = F_iman * 0.06
-//
-// equivalente:
-//
-// Torque = F_galga * 0.04
+// Torque = F_galga * TORQUE_ARM_M
 //
 // ============================================================
 
-const double MAGNET_TO_PIVOT_M = 0.060;
-
-const double PIVOT_TO_LOADCELL_M = 0.040;
+const double TORQUE_ARM_M = 0.020;
 
 
 // ============================================================
@@ -1226,14 +1215,12 @@ void loop()
 
     double forceLoadCell_N = 0.0;
 
-    double forceMagnet_N = 0.0;
-
     double torque_Nm = 0.0;
 
 
     if (hxOK)
     {
-      // Masa
+      // Masa (sin filtrar)
       massUnfiltered_g =
         MASS_SLOPE *
         (
@@ -1241,15 +1228,13 @@ void loop()
           zeroRaw
         );
 
-
-      // Kalman
+      // Kalman sobre la masa
       massFiltered_g =
         applyKalman(
           massUnfiltered_g
         );
 
-
-      // Fuerza galga
+      // Fuerza galga [N]
       forceLoadCell_N =
         (
           massFiltered_g /
@@ -1258,20 +1243,10 @@ void loop()
         *
         GRAVITY;
 
-
-      // Fuerza equivalente en iman
-      forceMagnet_N =
-        forceLoadCell_N *
-        (
-          PIVOT_TO_LOADCELL_M /
-          MAGNET_TO_PIVOT_M
-        );
-
-
-      // Torque
+      // Torque = F_galga * brazo (0.020 m)
       torque_Nm =
-        forceMagnet_N *
-        MAGNET_TO_PIVOT_M;
+        forceLoadCell_N *
+        TORQUE_ARM_M;
     }
 
 
@@ -1399,11 +1374,9 @@ void loop()
       "\"kalman_gain\":%.5f,"
 
       "\"force_N\":%.6f,"
-      "\"force_magnet_N\":%.6f,"
       "\"torque_Nm\":%.8f,"
 
-      "\"magnet_to_pivot_m\":%.3f,"
-      "\"pivot_to_loadcell_m\":%.3f,"
+      "\"torque_arm_m\":%.3f,"
 
       "\"hx_ok\":%s,"
 
@@ -1450,11 +1423,9 @@ void loop()
       kalmanGain,
 
       forceLoadCell_N,
-      forceMagnet_N,
       torque_Nm,
 
-      MAGNET_TO_PIVOT_M,
-      PIVOT_TO_LOADCELL_M,
+      TORQUE_ARM_M,
 
       hxOK
         ? "true"
