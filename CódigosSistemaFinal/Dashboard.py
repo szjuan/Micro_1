@@ -11,7 +11,8 @@
 #    0 · Bienvenida
 #    1 · Configuración + Calibración
 #    2 · Selección de prueba
-#    3 · Gráficas en tiempo real + exportación
+#    3 · Gráficas en tiempo real (P1 / P2 captura)
+#    P2 extra · 4 curvas características vs TL
 # ============================================================
 
 import csv
@@ -22,6 +23,7 @@ import ssl
 import sys
 import threading
 import time
+import bisect
 from datetime import datetime
 
 import paho.mqtt.client as mqtt
@@ -57,8 +59,9 @@ SERIAL_BAUD = 115200
 # ============================================================
 #  FUENTE PROGRAMABLE KEYSIGHT  —  PyVISA  (Canal 1)
 # ============================================================
-VISA_ADDRESS    = "USB0::0x2A8D::0x3302::MY61004672::0::INSTR"
+VISA_ADDRESS    = "USB0::0x2A8D::0x3302::MY61004643::0::INSTR"
 FUENTE_INTERVAL = 0.5   # segundos entre lecturas
+FUENTE_I_LIMITE = 1.0   # límite de corriente CH1 [A]
 
 # ============================================================
 #  PARAMETROS DE ADQUISICION
@@ -116,8 +119,84 @@ _fuente_output_deseada = True
 _escalon_stop = threading.Event()   # set() para detener la secuencia
 
 # Captura de puntos Prueba 2
-_p2_puntos: list[dict] = []          # cada entrada: {TL, n, I, Pm, eta}
+_p2_puntos: list[dict] = []          # cada entrada: {d, TL, n, I, Pm, eta}
 _captura_p2_stop = threading.Event() # set() para cancelar captura activa
+_p2_distancia_mm: float = 12.0       # distancia imán–eje vigente hasta que el usuario la cambie
+
+# Base FEM del freno (RPM × airgap → TL teórico)
+_FEM_CSV = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "DatosTeoricos", "eddy_brake_fem_database.csv",
+))
+_fem_rpms: list[float] = []
+_fem_gaps: list[float] = []
+_fem_T: dict[tuple[float, float], float] = {}
+
+
+def _cargar_fem_csv(ruta: str = _FEM_CSV) -> bool:
+    """Carga rpm, air_gap_mm, torque_Nm del CSV FEM."""
+    global _fem_rpms, _fem_gaps, _fem_T
+    _fem_T = {}
+    rpms: set[float] = set()
+    gaps: set[float] = set()
+    try:
+        with open(ruta, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    rpm = round(float(row["rpm"]), 4)
+                    gap = round(float(row["air_gap_mm"]), 4)
+                    tl  = float(row["torque_Nm"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                _fem_T[(rpm, gap)] = tl
+                rpms.add(rpm)
+                gaps.add(gap)
+    except OSError:
+        return False
+    _fem_rpms = sorted(rpms)
+    _fem_gaps = sorted(gaps)
+    return bool(_fem_T)
+
+
+def _vecinos(sorted_vals: list[float], x: float) -> tuple[float, float]:
+    """Devuelve (x0, x1) que acotan x en una lista ordenada (clamp en bordes)."""
+    if not sorted_vals:
+        return (x, x)
+    if x <= sorted_vals[0]:
+        return (sorted_vals[0], sorted_vals[0])
+    if x >= sorted_vals[-1]:
+        return (sorted_vals[-1], sorted_vals[-1])
+    i = bisect.bisect_left(sorted_vals, x)
+    if abs(sorted_vals[i] - x) < 1e-9:
+        return (sorted_vals[i], sorted_vals[i])
+    return (sorted_vals[i - 1], sorted_vals[i])
+
+
+def _interp1(x: float, x0: float, x1: float, y0: float, y1: float) -> float:
+    if abs(x1 - x0) < 1e-12:
+        return y0
+    return y0 + (x - x0) * (y1 - y0) / (x1 - x0)
+
+
+def _lookup_tl_fem(rpm: float, airgap_mm: float) -> float | None:
+    """Interpolación bilineal de TL teórico en la malla FEM (RPM × airgap)."""
+    if not _fem_T:
+        return None
+    r0, r1 = _vecinos(_fem_rpms, rpm)
+    g0, g1 = _vecinos(_fem_gaps, airgap_mm)
+    try:
+        T00 = _fem_T[(r0, g0)]
+        T01 = _fem_T[(r0, g1)]
+        T10 = _fem_T[(r1, g0)]
+        T11 = _fem_T[(r1, g1)]
+    except KeyError:
+        return None
+    T_g_r0 = _interp1(airgap_mm, g0, g1, T00, T01)
+    T_g_r1 = _interp1(airgap_mm, g0, g1, T10, T11)
+    return _interp1(rpm, r0, r1, T_g_r0, T_g_r1)
+
+
+_cargar_fem_csv()
 
 # Confirmación de tara desde ESP32
 _tara_ok_event = threading.Event()  # set() cuando llega {"status":"tara_ok"}
@@ -243,9 +322,10 @@ def _leer_fuente_loop():
         inst.write_termination = "\n"
         inst.read_termination  = "\n"
 
-        # Seleccionar CH1, fijar voltaje a 0 y respetar el estado
-        # de salida solicitado por la interfaz.
+        # Seleccionar CH1, limitar corriente a 1 A, voltaje 0
+        # y respetar el estado de salida solicitado por la interfaz.
         inst.write("INST:SEL CH1")
+        inst.write(f"CURR {FUENTE_I_LIMITE:.3f}")
         inst.write("VOLT 0")
         inst.write("OUTP ON" if _fuente_output_deseada else "OUTP OFF")
 
@@ -267,11 +347,24 @@ def _leer_fuente_loop():
         señales.conexion_msg.emit(f"PyVISA: {e} (sin fuente, V=0 I=0)")
 
 
-def _set_voltaje(v: float):
-    """Envía VOLT <v> al CH1. Seguro para llamar desde la GUI."""
+def _set_corriente_limite(i: float = FUENTE_I_LIMITE):
+    """Fija el límite de corriente del CH1 (CURR)."""
     if _fuente_inst is None:
         return
     try:
+        _fuente_inst.write("INST:SEL CH1")
+        _fuente_inst.write(f"CURR {i:.3f}")
+    except Exception:
+        pass
+
+
+def _set_voltaje(v: float):
+    """Envía VOLT <v> al CH1 y reafirma el límite de 1 A. Seguro para llamar desde la GUI."""
+    if _fuente_inst is None:
+        return
+    try:
+        _fuente_inst.write("INST:SEL CH1")
+        _fuente_inst.write(f"CURR {FUENTE_I_LIMITE:.3f}")
         _fuente_inst.write(f"VOLT {v:.3f}")
     except Exception:
         pass
@@ -284,6 +377,8 @@ def _set_output(on: bool):
     if _fuente_inst is None:
         return
     try:
+        _fuente_inst.write("INST:SEL CH1")
+        _fuente_inst.write(f"CURR {FUENTE_I_LIMITE:.3f}")
         _fuente_inst.write("OUTP ON" if on else "OUTP OFF")
     except Exception:
         pass
@@ -340,10 +435,10 @@ def _run_escalones(v_ini: float, v_fin: float, paso: float, duracion: float):
 # ============================================================
 #  CAPTURA DE PUNTO ÚNICO — PRUEBA 2
 # ============================================================
-def _run_captura_p2(duracion_s: float = 10.0):
+def _run_captura_p2(duracion_s: float = 10.0, distancia_mm: float = 0.0):
     """
     Hilo background. Muestrea todas las variables durante duracion_s segundos,
-    calcula el promedio y agrega un único punto a _p2_puntos.
+    calcula el promedio y agrega un único punto a _p2_puntos (incluye distancia).
     Emite captura_p2_prog cada segundo y captura_p2_lista al terminar.
     """
     _captura_p2_stop.clear()
@@ -374,11 +469,23 @@ def _run_captura_p2(duracion_s: float = 10.0):
 
     if muestras["TL"]:
         punto = {k: sum(v) / len(v) for k, v in muestras.items()}
+        punto["d"] = float(distancia_mm)
+        tl_teo = _lookup_tl_fem(punto["n"], punto["d"])
+        punto["TL_teo"] = tl_teo
         with _lock:
             _p2_puntos.append(punto)
-        señales.captura_p2_prog.emit(
-            f"✓  Punto #{len(_p2_puntos)} registrado · TL={punto['TL']:.4f} N·m"
-        )
+        if tl_teo is None:
+            señales.captura_p2_prog.emit(
+                f"✓  Punto #{len(_p2_puntos)} · d={punto['d']:.1f} mm · "
+                f"n={punto['n']:.0f} RPM · TL exp={punto['TL']:.4f} N·m · "
+                f"TL teó. no encontrado"
+            )
+        else:
+            señales.captura_p2_prog.emit(
+                f"✓  Punto #{len(_p2_puntos)} · d={punto['d']:.1f} mm · "
+                f"n={punto['n']:.0f} RPM · TL exp={punto['TL']:.4f} · "
+                f"TL teó.={tl_teo:.4f} N·m"
+            )
     else:
         señales.captura_p2_prog.emit("Sin datos durante la captura")
 
@@ -1028,8 +1135,11 @@ class _PantallaGraficas(QWidget):
             self._btn_outp_p2.setChecked(False)
             _set_output(False)
             self._ensayo_activo = False
+            self._spin_dist.setValue(_p2_distancia_mm)
             for curva in (self._p2_ct_w, self._p2_ct_i,
-                          self._p2_ct_pm, self._p2_ct_n):
+                          self._p2_ct_pm, self._p2_ct_n,
+                          self._p2_ct_car_n, self._p2_ct_car_i,
+                          self._p2_ct_car_pm, self._p2_ct_car_eta):
                 curva.setData([], [])
 
     # ── construcción de la UI ─────────────────────────────────
@@ -1053,16 +1163,18 @@ class _PantallaGraficas(QWidget):
         # ── Cuerpo principal (panel izquierdo + gráficas)
         body = QHBoxLayout(); body.setSpacing(12)
 
-        # Panel izquierdo — QStackedWidget: índice 0=P1, 1=P2
+        # Panel izquierdo — QStackedWidget: 0=P1, 1=P2 captura, 2=P2 características
         self._panel_stack = QStackedWidget()
         self._panel_stack.setFixedWidth(232)
         self._panel_p1 = self._hacer_panel_p1()
         self._panel_p2 = self._hacer_panel_p2()
-        self._panel_stack.addWidget(self._panel_p1)   # index 0
-        self._panel_stack.addWidget(self._panel_p2)   # index 1
+        self._panel_p2_carac = self._hacer_panel_p2_carac()
+        self._panel_stack.addWidget(self._panel_p1)        # index 0
+        self._panel_stack.addWidget(self._panel_p2)        # index 1
+        self._panel_stack.addWidget(self._panel_p2_carac)  # index 2
         body.addWidget(self._panel_stack, stretch=0)
 
-        # Panel derecho — QStackedWidget: P1 (2 vertical) | P2 (2×2)
+        # Panel derecho — 0=P1 | 1=P2 (2 gráficas) | 2=P2 (4 características)
         self._graf_stack = QStackedWidget()
 
         # ── Prueba 1: dos gráficas apiladas ────────────────────
@@ -1075,24 +1187,64 @@ class _PantallaGraficas(QWidget):
         self._curva_bot_teo = self._plot_bot.plot(pen=_pen_teo_v, name="V(t) Teórico")
         col_p1.addWidget(self._plot_top, stretch=1)
         col_p1.addWidget(self._plot_bot, stretch=1)
+        self._habilitar_click_coords(self._plot_top)
+        self._habilitar_click_coords(self._plot_bot)
         self._graf_stack.addWidget(w_p1)   # index 0
-
-        # ── Prueba 2: cuatro gráficas 2×2 (vs TL) ─────────────
-        w_p2 = QWidget(); grid_p2 = QGridLayout(w_p2); grid_p2.setSpacing(8); grid_p2.setContentsMargins(0,0,0,0)
 
         _pen_exp = lambda c: pg.mkPen(color=c, width=2.2)
         _pen_teo = lambda c: pg.mkPen(color=c, width=1.8, style=Qt.PenStyle.DashLine)
+        _sym = dict(symbol="o", symbolSize=8)
 
-        def _make_p2_plot(title, ylabel, color_exp, color_teo):
-            pw = pg.PlotWidget(); pw.setBackground(_BG)
+        def _style_plot(pw, title, ylabel, xlabel):
+            pw.setBackground(_BG)
             pw.showGrid(x=True, y=True, alpha=0.15)
             pw.setTitle(title, color="#C9D1D9", size="11pt")
-            for ax in ("left","bottom"):
+            for ax in ("left", "bottom"):
                 pw.getAxis(ax).setPen(pg.mkPen(color=_BORDER))
                 pw.getAxis(ax).setTextPen(pg.mkPen(color=_SEC))
             pw.setLabel("left", ylabel, color=_SEC)
-            pw.setLabel("bottom", "TL (N·m)", color=_SEC)
-            c_exp = pw.plot(pen=_pen_exp(color_exp), name="Experimental")
+            pw.setLabel("bottom", xlabel, color=_SEC)
+            self._habilitar_click_coords(pw)
+
+        # ── Prueba 2 captura: 2 gráficas apiladas ──────────────
+        w_p2 = QWidget(); col_p2 = QVBoxLayout(w_p2); col_p2.setSpacing(8); col_p2.setContentsMargins(0,0,0,0)
+
+        self._p2_plot_carac = pg.PlotWidget()
+        _style_plot(self._p2_plot_carac,
+                    "Curva característica del motor",
+                    "I / n / η / Pm", "TL (N·m)")
+        self._p2_plot_carac.addLegend(offset=(8, 8))
+        self._p2_c_car_n   = self._p2_plot_carac.plot(pen=_pen_exp(_CYAN),    name="n (RPM)",  **_sym)
+        self._p2_c_car_i   = self._p2_plot_carac.plot(pen=_pen_exp(_ORANGE),  name="I (A)",    **_sym)
+        self._p2_c_car_pm  = self._p2_plot_carac.plot(pen=_pen_exp(_PURPLE),  name="Pm (W)",   **_sym)
+        self._p2_c_car_eta = self._p2_plot_carac.plot(pen=_pen_exp("#58A6FF"), name="η (%)",   **_sym)
+        self._p2_ct_car_n   = self._p2_plot_carac.plot(pen=_pen_teo("#FFFFFF"), name="n teó.")
+        self._p2_ct_car_i   = self._p2_plot_carac.plot(pen=_pen_teo("#FFD700"), name="I teó.")
+        self._p2_ct_car_pm  = self._p2_plot_carac.plot(pen=_pen_teo("#C0A0FF"), name="Pm teó.")
+        self._p2_ct_car_eta = self._p2_plot_carac.plot(pen=_pen_teo("#A0D0FF"), name="η teó.")
+
+        self._p2_plot_dist = pg.PlotWidget()
+        _style_plot(self._p2_plot_dist,
+                    "Torque de carga vs Distancia imán–eje",
+                    "TL (N·m)", "Distancia (mm)")
+        self._p2_plot_dist.addLegend(offset=(8, 8))
+        self._p2_c_dist = self._p2_plot_dist.plot(
+            pen=_pen_exp(_RED_C), name="TL exp", **_sym)
+        self._p2_ct_dist = self._p2_plot_dist.plot(
+            pen=_pen_teo("#FFD700"), name="TL teó. FEM",
+            symbol="t", symbolSize=9, symbolBrush="#FFD700")
+
+        col_p2.addWidget(self._p2_plot_carac, stretch=1)
+        col_p2.addWidget(self._p2_plot_dist,  stretch=1)
+        self._graf_stack.addWidget(w_p2)   # index 1
+
+        # ── Prueba 2 extra: cuatro gráficas 2×2 (vs TL) ───────
+        w_p2c = QWidget(); grid_p2 = QGridLayout(w_p2c); grid_p2.setSpacing(8); grid_p2.setContentsMargins(0,0,0,0)
+
+        def _make_p2_plot(title, ylabel, color_exp, color_teo):
+            pw = pg.PlotWidget()
+            _style_plot(pw, title, ylabel, "TL (N·m)")
+            c_exp = pw.plot(pen=_pen_exp(color_exp), name="Experimental", **_sym)
             c_teo = pw.plot(pen=_pen_teo(color_teo),  name="Teórico")
             return pw, c_exp, c_teo
 
@@ -1105,7 +1257,7 @@ class _PantallaGraficas(QWidget):
         grid_p2.addWidget(self._p2_plot_i,  0, 1)
         grid_p2.addWidget(self._p2_plot_pm, 1, 0)
         grid_p2.addWidget(self._p2_plot_n,  1, 1)
-        self._graf_stack.addWidget(w_p2)   # index 1
+        self._graf_stack.addWidget(w_p2c)  # index 2
 
         body.addWidget(self._graf_stack, stretch=1)
 
@@ -1361,7 +1513,7 @@ class _PantallaGraficas(QWidget):
         return panel
 
     # ─────────────────────────────────────────────────────────────
-    #  Panel Prueba 2: Variables · Fuente · CSV P2
+    #  Panel Prueba 2: Variables · Fuente · Distancia · Captura
     # ─────────────────────────────────────────────────────────────
     def _hacer_panel_p2(self) -> QFrame:
         panel = QFrame(); panel.setObjectName("panel_p2")
@@ -1371,18 +1523,22 @@ class _PantallaGraficas(QWidget):
         # P2 siempre inicia con la salida apagada.
         self._seccion_fuente(v, "_spin_volt_p2", "_btn_outp_p2", inicial_on=False)
 
-        # ── Curvas Teóricas P2 ─────────────────────────────────
-        lbl_ct = QLabel("Curvas Teóricas · Prueba 2")
-        lbl_ct.setStyleSheet("font-size:11px; font-weight:bold; color:#58A6FF;")
-        v.addWidget(lbl_ct)
-        self._btn_teo_p2_w,  self._lbl_teo_p2_w  = self._bloque_csv_ui(
-            "n(TL) teórico",  self._importar_csv_p2_w,  v)
-        self._btn_teo_p2_i,  self._lbl_teo_p2_i  = self._bloque_csv_ui(
-            "I(TL) teórico",  self._importar_csv_p2_i,  v)
-        self._btn_teo_p2_pm, self._lbl_teo_p2_pm = self._bloque_csv_ui(
-            "Pm(TL) teórico", self._importar_csv_p2_pm, v)
-        self._btn_teo_p2_n,  self._lbl_teo_p2_n  = self._bloque_csv_ui(
-            "η(TL) teórico",  self._importar_csv_p2_n,  v)
+        # ── Distancia imán–eje ────────────────────────────────
+        lbl_d = QLabel("Distancia imán–eje")
+        lbl_d.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_YELLOW};")
+        v.addWidget(lbl_d)
+
+        self._spin_dist = QDoubleSpinBox()
+        self._spin_dist.setRange(0.0, 50.0)
+        self._spin_dist.setSingleStep(0.5)
+        self._spin_dist.setDecimals(1)
+        self._spin_dist.setSuffix(" mm")
+        self._spin_dist.setValue(_p2_distancia_mm)
+        self._spin_dist.setKeyboardTracking(False)
+        self._spin_dist.setFixedHeight(28)
+        self._spin_dist.setStyleSheet(self._sty_spin_ctrl())
+        self._spin_dist.editingFinished.connect(self._guardar_distancia_p2)
+        v.addWidget(self._spin_dist)
         v.addWidget(_sep())
 
         # ── Captura de punto ──────────────────────────────────
@@ -1390,7 +1546,6 @@ class _PantallaGraficas(QWidget):
         lbl_cap.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_GREEN_H};")
         v.addWidget(lbl_cap)
 
-        # Duración de captura
         sty_s = self._sty_spin_ctrl()
         self._spin_cap_dur = QDoubleSpinBox()
         self._spin_cap_dur.setRange(3.0, 120.0); self._spin_cap_dur.setValue(10.0)
@@ -1402,7 +1557,6 @@ class _PantallaGraficas(QWidget):
         row_dur.addWidget(lbl_dur); row_dur.addWidget(self._spin_cap_dur)
         v.addLayout(row_dur)
 
-        # Contador de puntos y botón
         self._lbl_cap_contador = QLabel("Puntos: 0")
         self._lbl_cap_contador.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._lbl_cap_contador.setStyleSheet(
@@ -1430,6 +1584,9 @@ class _PantallaGraficas(QWidget):
 
         v.addWidget(_sep())
 
+        b4 = self._btn_nav("📊  4 Características", _CYAN, "#0D419D", "#1F6FEB", "#1158C7")
+        b4.clicked.connect(self._ir_caracteristicas); v.addWidget(b4)
+
         bc = self._btn_nav("🗑  Limpiar Gráficas", _SEC, "#21262D", _BORDER, "#30363D")
         bc.clicked.connect(self._limpiar_p2); v.addWidget(bc)
 
@@ -1440,16 +1597,81 @@ class _PantallaGraficas(QWidget):
         v.addStretch()
         return panel
 
+    # ─────────────────────────────────────────────────────────────
+    #  Panel Prueba 2 extra: 4 curvas características
+    # ─────────────────────────────────────────────────────────────
+    def _hacer_panel_p2_carac(self) -> QFrame:
+        panel = QFrame(); panel.setObjectName("panel_p2_carac")
+        v = QVBoxLayout(panel); v.setSpacing(5); v.setContentsMargins(10, 10, 10, 10)
+
+        self._seccion_vars(v, "_lbl_vars_p4")
+
+        lbl_ct = QLabel("Curvas Teóricas · Prueba 2")
+        lbl_ct.setStyleSheet("font-size:11px; font-weight:bold; color:#58A6FF;")
+        v.addWidget(lbl_ct)
+        self._btn_teo_p2_w,  self._lbl_teo_p2_w  = self._bloque_csv_ui(
+            "n(TL) teórico",  self._importar_csv_p2_w,  v)
+        self._btn_teo_p2_i,  self._lbl_teo_p2_i  = self._bloque_csv_ui(
+            "I(TL) teórico",  self._importar_csv_p2_i,  v)
+        self._btn_teo_p2_pm, self._lbl_teo_p2_pm = self._bloque_csv_ui(
+            "Pm(TL) teórico", self._importar_csv_p2_pm, v)
+        self._btn_teo_p2_n,  self._lbl_teo_p2_n  = self._bloque_csv_ui(
+            "η(TL) teórico",  self._importar_csv_p2_n,  v)
+        v.addWidget(_sep())
+
+        self._lbl_cap_contador_c = QLabel("Puntos: 0")
+        self._lbl_cap_contador_c.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_cap_contador_c.setStyleSheet(
+            f"font-size:12px; font-weight:bold; color:{_CYAN};")
+        v.addWidget(self._lbl_cap_contador_c)
+
+        bb = self._btn_nav("←  Volver a captura", _SEC, "#21262D", _BORDER, "#30363D")
+        bb.clicked.connect(self._volver_captura_p2); v.addWidget(bb)
+
+        bc = self._btn_nav("🗑  Limpiar Gráficas", _SEC, "#21262D", _BORDER, "#30363D")
+        bc.clicked.connect(self._limpiar_p2); v.addWidget(bc)
+
+        bv = self._btn_nav("←  Cambiar Prueba", _SEC, "#21262D", _BORDER, "#30363D")
+        bv.clicked.connect(self._volver_menu); v.addWidget(bv)
+        bf = self._btn_nav("⏹  Finalizar", "#FF7B72", "#3D1515", "#6A1C1C", "#5C1F1F")
+        bf.clicked.connect(self._finalizar);  v.addWidget(bf)
+        v.addStretch()
+        return panel
+
+    def _ir_caracteristicas(self):
+        """Pantalla extra P2: 4 gráficas características vs TL."""
+        self._graf_stack.setCurrentIndex(2)
+        self._panel_stack.setCurrentIndex(2)
+        self._lbl_titulo.setText("Prueba 2 · Curvas características")
+        self._actualizar_graficas_p2()
+        if self._btn_outp_p2.isChecked():
+            self._mostrar_teo_p2()
+
+    def _volver_captura_p2(self):
+        """Regresa a la pantalla de captura (2 gráficas)."""
+        self._graf_stack.setCurrentIndex(1)
+        self._panel_stack.setCurrentIndex(1)
+        self._lbl_titulo.setText("Prueba 2 · Caracterización con Freno")
+
     # ── Captura Prueba 2 ──────────────────────────────────────
+    def _guardar_distancia_p2(self) -> float:
+        """Confirma el recuadro, guarda la distancia y la deja visible hasta que el usuario la cambie."""
+        global _p2_distancia_mm
+        self._spin_dist.interpretText()
+        _p2_distancia_mm = float(self._spin_dist.value())
+        self._spin_dist.setValue(_p2_distancia_mm)
+        return _p2_distancia_mm
+
     def _capturar_punto_p2(self):
         """Inicia hilo de captura de 10 s para Prueba 2."""
         self._ensayo_activo = True        # activar actualización de labels
         self._btn_cap.setEnabled(False)
         dur = self._spin_cap_dur.value()
+        dist = self._guardar_distancia_p2()
         self._lbl_cap_prog.setText(f"⏳  Iniciando {int(dur)} s…")
         threading.Thread(
             target=_run_captura_p2,
-            args=(dur,),
+            args=(dur, dist),
             daemon=True,
         ).start()
 
@@ -1461,22 +1683,44 @@ class _PantallaGraficas(QWidget):
         """Llamado cuando el hilo de captura termina — actualiza gráficos y habilita botón."""
         self._actualizar_graficas_p2()
         self._btn_cap.setEnabled(True)
-        # Actualizar contador
+        self._spin_dist.setValue(_p2_distancia_mm)
         with _lock:
             n_pts = len(_p2_puntos)
         self._lbl_cap_contador.setText(f"Puntos: {n_pts}")
+        self._lbl_cap_contador_c.setText(f"Puntos: {n_pts}")
 
     def _actualizar_graficas_p2(self):
-        """Redibuja los 4 gráficos de P2 a partir de los puntos capturados."""
+        """Redibuja las 2 gráficas de captura y las 4 características."""
         with _lock:
             puntos = list(_p2_puntos)
         if not puntos:
             return
-        TL  = [p["TL"]  for p in puntos]
-        n   = [p["n"]   for p in puntos]
-        I   = [p["I"]   for p in puntos]
-        Pm  = [p["Pm"]  for p in puntos]
-        eta = [p["eta"] for p in puntos]
+
+        pts_d = sorted(puntos, key=lambda p: p.get("d", 0.0))
+        self._p2_c_dist.setData(
+            [p.get("d", 0.0) for p in pts_d],
+            [p["TL"] for p in pts_d],
+        )
+        pts_teo = [p for p in pts_d if p.get("TL_teo") is not None]
+        if pts_teo:
+            self._p2_ct_dist.setData(
+                [p["d"] for p in pts_teo],
+                [p["TL_teo"] for p in pts_teo],
+            )
+        else:
+            self._p2_ct_dist.setData([], [])
+
+        pts_t = sorted(puntos, key=lambda p: p["TL"])
+        TL  = [p["TL"]  for p in pts_t]
+        n   = [p["n"]   for p in pts_t]
+        I   = [p["I"]   for p in pts_t]
+        Pm  = [p["Pm"]  for p in pts_t]
+        eta = [p["eta"] for p in pts_t]
+
+        self._p2_c_car_n.setData(TL, n)
+        self._p2_c_car_i.setData(TL, I)
+        self._p2_c_car_pm.setData(TL, Pm)
+        self._p2_c_car_eta.setData(TL, eta)
 
         self._p2_c_w.setData(TL, n)
         self._p2_c_i.setData(TL, I)
@@ -1484,16 +1728,92 @@ class _PantallaGraficas(QWidget):
         self._p2_c_n.setData(TL, eta)
 
     def _limpiar_p2(self):
-        """Vacía puntos capturados, buffers y las 4 curvas experimentales de Prueba 2."""
-        _captura_p2_stop.set()            # detener captura activa si la hay
+        """Vacía puntos capturados y todas las curvas experimentales de Prueba 2."""
+        _captura_p2_stop.set()
         with _lock:
             _p2_puntos.clear()
-        _resetear_tiempo()                # vacía buffers y resetea t=0
-        for c in (self._p2_c_w, self._p2_c_i, self._p2_c_pm, self._p2_c_n):
+        _resetear_tiempo()
+        for c in (
+            self._p2_c_w, self._p2_c_i, self._p2_c_pm, self._p2_c_n,
+            self._p2_c_car_n, self._p2_c_car_i, self._p2_c_car_pm, self._p2_c_car_eta,
+            self._p2_c_dist, self._p2_ct_dist,
+        ):
             c.setData([], [])
         self._lbl_cap_contador.setText("Puntos: 0")
+        self._lbl_cap_contador_c.setText("Puntos: 0")
         self._lbl_cap_prog.setText("Listo")
         self._btn_cap.setEnabled(True)
+        for pw in (self._p2_plot_dist, self._p2_plot_carac,
+                   self._p2_plot_w, self._p2_plot_i, self._p2_plot_pm, self._p2_plot_n):
+            lbl = getattr(pw, "_coord_label", None)
+            mk  = getattr(pw, "_coord_marker", None)
+            if lbl is not None:
+                lbl.hide()
+            if mk is not None:
+                mk.setData([], [])
+
+    def _habilitar_click_coords(self, pw: pg.PlotWidget):
+        """Al hacer clic cerca de un punto, muestra sus coordenadas."""
+        label = pg.TextItem(
+            color=_PRI, anchor=(0.0, 1.15),
+            fill=(13, 17, 23, 220), border=_CYAN,
+        )
+        label.setZValue(200)
+        label.hide()
+        pw.addItem(label)
+
+        marker = pg.ScatterPlotItem(
+            size=14, symbol="o",
+            pen=pg.mkPen("#FFFFFF", width=2),
+            brush=pg.mkBrush(0, 0, 0, 0),
+        )
+        marker.setZValue(199)
+        marker._es_coord_ui = True  # type: ignore[attr-defined]
+        pw.addItem(marker)
+        pw._coord_label = label  # type: ignore[attr-defined]
+        pw._coord_marker = marker  # type: ignore[attr-defined]
+
+        def _on_click(ev):
+            if ev.button() != Qt.MouseButton.LeftButton or ev.double():
+                return
+            scene_pos = ev.scenePos()
+            if not pw.sceneBoundingRect().contains(scene_pos):
+                return
+            vb = pw.getViewBox()
+            mejor = None  # (d2, x, y, nombre)
+            radio2 = 20.0 * 20.0
+            for item in pw.listDataItems():
+                if getattr(item, "_es_coord_ui", False):
+                    continue
+                datos = item.getData()
+                if not datos or datos[0] is None or len(datos[0]) == 0:
+                    continue
+                xs, ys = datos
+                nombre = item.name() or ""
+                for x, y in zip(xs, ys):
+                    try:
+                        xf, yf = float(x), float(y)
+                    except (TypeError, ValueError):
+                        continue
+                    sp = vb.mapViewToScene(pg.Point(xf, yf))
+                    dx, dy = sp.x() - scene_pos.x(), sp.y() - scene_pos.y()
+                    d2 = dx * dx + dy * dy
+                    if d2 < radio2 and (mejor is None or d2 < mejor[0]):
+                        mejor = (d2, xf, yf, nombre)
+            if mejor is None:
+                label.hide()
+                marker.setData([], [])
+                return
+            _, x, y, nombre = mejor
+            xl = pw.getAxis("bottom").labelText or "X"
+            yl = pw.getAxis("left").labelText or "Y"
+            cab = f"{nombre}\n" if nombre else ""
+            label.setText(f"{cab}{xl} = {x:.6g}\n{yl} = {y:.6g}")
+            label.setPos(x, y)
+            label.show()
+            marker.setData([x], [y])
+
+        pw.scene().sigMouseClicked.connect(_on_click)
 
     @staticmethod
     def _make_plot_dual():
@@ -1577,7 +1897,7 @@ class _PantallaGraficas(QWidget):
             "Pm": f"{Pm[-1]:.5f}",
             "η":  f"{eta[-1]:.2f}",
         }
-        for d in (self._lbl_vars_p1, self._lbl_vars_p2):
+        for d in (self._lbl_vars_p1, self._lbl_vars_p2, self._lbl_vars_p4):
             for sym, lbl in d.items():
                 lbl.setText(vals.get(sym, "—"))
 
@@ -1740,15 +2060,17 @@ class _PantallaGraficas(QWidget):
     def _mostrar_teo_p2(self):
         """Grafica todas las curvas teóricas P2 que estén cargadas."""
         _map = [
-            ("_teo_p2_w_data",  self._p2_ct_w,  self._p2_plot_w),
-            ("_teo_p2_i_data",  self._p2_ct_i,  self._p2_plot_i),
-            ("_teo_p2_pm_data", self._p2_ct_pm, self._p2_plot_pm),
-            ("_teo_p2_n_data",  self._p2_ct_n,  self._p2_plot_n),
+            ("_teo_p2_w_data",  self._p2_ct_w,     self._p2_plot_w,     self._p2_ct_car_n),
+            ("_teo_p2_i_data",  self._p2_ct_i,     self._p2_plot_i,     self._p2_ct_car_i),
+            ("_teo_p2_pm_data", self._p2_ct_pm,    self._p2_plot_pm,    self._p2_ct_car_pm),
+            ("_teo_p2_n_data",  self._p2_ct_n,     self._p2_plot_n,     self._p2_ct_car_eta),
         ]
         dibujadas = 0
-        for attr, curva, plot in _map:
+        for attr, curva, plot, curva_comb in _map:
             if hasattr(self, attr) and getattr(self, attr):
-                curva.setData(*getattr(self, attr))
+                datos = getattr(self, attr)
+                curva.setData(*datos)
+                curva_comb.setData(*datos)
                 plot.enableAutoRange()
                 plot.autoRange()
                 dibujadas += 1
@@ -1800,6 +2122,8 @@ class _PantallaGraficas(QWidget):
     def _volver_menu(self):
         """Detiene escalones activos y vuelve a la pantalla de selección de prueba."""
         _escalon_stop.set()
+        _captura_p2_stop.set()
+        self._ensayo_activo = False
         if self._volver_cb:
             self._volver_cb()
 
@@ -1860,4 +2184,12 @@ if __name__ == "__main__":
     app.setStyleSheet(STYLE_APP)
     win = VentanaPrincipal()
     win.show()
+    if _fem_T:
+        señales.conexion_msg.emit(
+            f"FEM cargado · {len(_fem_T)} pts · "
+            f"RPM {_fem_rpms[0]:.0f}–{_fem_rpms[-1]:.0f} · "
+            f"gap {_fem_gaps[0]:.1f}–{_fem_gaps[-1]:.1f} mm"
+        )
+    else:
+        señales.conexion_msg.emit(f"No se pudo cargar FEM: {_FEM_CSV}")
     sys.exit(app.exec())
