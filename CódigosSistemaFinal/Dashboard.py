@@ -108,6 +108,9 @@ _inicio_tiempo = time.time()
 # Valores actuales de la fuente (actualizados por hilo PyVISA)
 _V_fuente    = 0.0
 _fuente_inst = None   # handle pyvisa.Resource compartido con controles GUI
+# Estado de salida deseado. Permite que la GUI defina ON/OFF incluso
+# si la fuente todavía no terminó de conectarse por PyVISA.
+_fuente_output_deseada = True
 
 # Prueba de escalones de voltaje
 _escalon_stop = threading.Event()   # set() para detener la secuencia
@@ -231,7 +234,7 @@ def _leer_fuente_loop():
     Lee V e I del canal 1 de la fuente Keysight en loop.
     Guarda el handle en _fuente_inst para que la GUI pueda enviar comandos.
     """
-    global _V_fuente, _I_fuente, _fuente_inst
+    global _V_fuente, _I_fuente, _fuente_inst, _fuente_output_deseada
     try:
         import pyvisa  # type: ignore
         rm   = pyvisa.ResourceManager()
@@ -240,10 +243,11 @@ def _leer_fuente_loop():
         inst.write_termination = "\n"
         inst.read_termination  = "\n"
 
-        # Seleccionar CH1, fijar voltaje a 0 y encender salida
+        # Seleccionar CH1, fijar voltaje a 0 y respetar el estado
+        # de salida solicitado por la interfaz.
         inst.write("INST:SEL CH1")
         inst.write("VOLT 0")
-        inst.write("OUTP ON")
+        inst.write("OUTP ON" if _fuente_output_deseada else "OUTP OFF")
 
         _fuente_inst = inst   # exponer handle para controles GUI
 
@@ -274,7 +278,9 @@ def _set_voltaje(v: float):
 
 
 def _set_output(on: bool):
-    """Enciende o apaga la salida CH1."""
+    """Enciende o apaga la salida CH1 y recuerda el estado solicitado."""
+    global _fuente_output_deseada
+    _fuente_output_deseada = bool(on)
     if _fuente_inst is None:
         return
     try:
@@ -1013,6 +1019,19 @@ class _PantallaGraficas(QWidget):
         self._panel_stack.setCurrentIndex(0 if es_p1 else 1)
         self._graf_stack.setCurrentIndex(0 if es_p1 else 1)
 
+        if es_p1:
+            # Mantener sincronizado el estado real de la fuente con el botón de P1.
+            _set_output(self._btn_outp.isChecked())
+        else:
+            # REQUISITO P2: cada vez que se entra a la Prueba 2, la salida
+            # debe comenzar realmente apagada y las curvas teóricas ocultas.
+            self._btn_outp_p2.setChecked(False)
+            _set_output(False)
+            self._ensayo_activo = False
+            for curva in (self._p2_ct_w, self._p2_ct_i,
+                          self._p2_ct_pm, self._p2_ct_n):
+                curva.setData([], [])
+
     # ── construcción de la UI ─────────────────────────────────
     def _construir(self):
         root = QVBoxLayout(self)
@@ -1146,7 +1165,8 @@ class _PantallaGraficas(QWidget):
         setattr(self, lbl_dict_attr, d)
         v.addWidget(_sep())
 
-    def _seccion_fuente(self, v: QVBoxLayout, spin_attr: str, outp_attr: str):
+    def _seccion_fuente(self, v: QVBoxLayout, spin_attr: str, outp_attr: str,
+                         inicial_on: bool = True):
         """Añade control fuente CH1 al layout v."""
         lbl_f = QLabel("Control Fuente · CH1")
         lbl_f.setStyleSheet(f"font-size:11px; font-weight:bold; color:{_YELLOW};")
@@ -1180,11 +1200,12 @@ class _PantallaGraficas(QWidget):
         """)
         def _on_aplicar():
             _set_voltaje(getattr(self, spin_attr).value())
-            self._ensayo_activo = True
+            # En P1 se conserva el comportamiento anterior.
+            # En P2, "Aplicar" SOLO fija el voltaje: las curvas teóricas
+            # aparecen exclusivamente cuando la salida pasa de OFF a ON.
             if spin_attr == "_spin_volt":
+                self._ensayo_activo = True
                 self._mostrar_teo_p1()
-            else:
-                self._mostrar_teo_p2()
         btn_ap.clicked.connect(_on_aplicar)
         row_f = QHBoxLayout(); row_f.setSpacing(6)
         row_f.addWidget(spin, stretch=1); row_f.addWidget(btn_ap)
@@ -1202,14 +1223,23 @@ class _PantallaGraficas(QWidget):
             font-size:11px; font-weight:bold;
             padding-top:2px; padding-bottom:6px;
         }} QPushButton:hover {{ background-color:#5C1F1F; }}"""
-        btn_out = QPushButton("⚡  Salida ON")
-        btn_out.setCheckable(True); btn_out.setChecked(True)
+        btn_out = QPushButton("⚡  Salida ON" if inicial_on else "○  Salida OFF")
+        btn_out.setCheckable(True); btn_out.setChecked(inicial_on)
         btn_out.setFixedHeight(32)
-        btn_out.setStyleSheet(sty_on)
-        def _toggle(checked, b=btn_out, s_on=sty_on, s_off=sty_off):
+        btn_out.setStyleSheet(sty_on if inicial_on else sty_off)
+
+        def _toggle(checked, b=btn_out, s_on=sty_on, s_off=sty_off, attr=outp_attr):
             _set_output(checked)
             b.setText("⚡  Salida ON" if checked else "○  Salida OFF")
             b.setStyleSheet(s_on if checked else s_off)
+
+            # REQUISITO P2: al pasar la salida de OFF -> ON se habilita
+            # la medición y se dibujan inmediatamente TODAS las curvas
+            # teóricas que ya hayan sido cargadas.
+            if attr == "_btn_outp_p2" and checked:
+                self._ensayo_activo = True
+                self._mostrar_teo_p2()
+
         btn_out.toggled.connect(_toggle)
         setattr(self, outp_attr, btn_out)
         v.addWidget(btn_out)
@@ -1338,7 +1368,8 @@ class _PantallaGraficas(QWidget):
         v = QVBoxLayout(panel); v.setSpacing(5); v.setContentsMargins(10, 10, 10, 10)
 
         self._seccion_vars(v, "_lbl_vars_p2")
-        self._seccion_fuente(v, "_spin_volt_p2", "_btn_outp_p2")
+        # P2 siempre inicia con la salida apagada.
+        self._seccion_fuente(v, "_spin_volt_p2", "_btn_outp_p2", inicial_on=False)
 
         # ── Curvas Teóricas P2 ─────────────────────────────────
         lbl_ct = QLabel("Curvas Teóricas · Prueba 2")
@@ -1627,6 +1658,44 @@ class _PantallaGraficas(QWidget):
             )
 
     # ── Importar CSVs teóricos ────────────────────────────────
+    @staticmethod
+    def _leer_csv_xy(ruta: str) -> tuple[list[float], list[float]]:
+        """
+        Lee un CSV de dos columnas y acepta tanto ';' como ','.
+        También ignora encabezados y tolera coma decimal cuando el
+        separador del archivo es punto y coma.
+        """
+        x, y = [], []
+        with open(ruta, "r", newline="", encoding="utf-8-sig") as f:
+            sample = f.read(4096)
+            f.seek(0)
+            # Si existe ';' se prioriza explícitamente porque los CSV de P2
+            # usan el formato: load torque;variable.
+            delimiter = ";" if ";" in sample else ","
+
+            reader = csv.reader(f, delimiter=delimiter)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    sx = row[0].strip()
+                    sy = row[1].strip()
+                    if delimiter == ";":
+                        sx = sx.replace(",", ".")
+                        sy = sy.replace(",", ".")
+                    x.append(float(sx))
+                    y.append(float(sy))
+                except (ValueError, TypeError):
+                    # Encabezados o filas no numéricas.
+                    continue
+
+        if not x:
+            raise ValueError(
+                "El CSV no contiene dos columnas numéricas válidas. "
+                "Formato esperado: eje_x;variable o eje_x,variable"
+            )
+        return x, y
+
     def _importar_csv_teo(self, tipo: str):
         """Lee un CSV (tiempo, valor) y guarda los datos; NO los grafica hasta iniciar ensayo."""
         titulo = "n(t) teórico — RPM" if tipo == "n" else "V(t) teórico — Voltaje"
@@ -1636,16 +1705,7 @@ class _PantallaGraficas(QWidget):
         if not ruta:
             return
         try:
-            t_teo, y_teo = [], []
-            with open(ruta, newline="", encoding="utf-8") as f:
-                for row in csv.reader(f):
-                    if len(row) < 2:
-                        continue
-                    try:
-                        t_teo.append(float(row[0]))
-                        y_teo.append(float(row[1]))
-                    except ValueError:
-                        continue
+            t_teo, y_teo = self._leer_csv_xy(ruta)
 
             nombre = os.path.basename(ruta)
             _sty_ok = "font-size:9px; color:#7EE787; padding-left:12px;"
@@ -1678,42 +1738,50 @@ class _PantallaGraficas(QWidget):
             self._curva_bot_teo.setData(*self._teo_v_data)
 
     def _mostrar_teo_p2(self):
-        """Grafica las curvas teóricas de P2 si están cargadas."""
+        """Grafica todas las curvas teóricas P2 que estén cargadas."""
         _map = [
-            ("_teo_p2_w_data",  self._p2_ct_w),
-            ("_teo_p2_i_data",  self._p2_ct_i),
-            ("_teo_p2_pm_data", self._p2_ct_pm),
-            ("_teo_p2_n_data",  self._p2_ct_n),
+            ("_teo_p2_w_data",  self._p2_ct_w,  self._p2_plot_w),
+            ("_teo_p2_i_data",  self._p2_ct_i,  self._p2_plot_i),
+            ("_teo_p2_pm_data", self._p2_ct_pm, self._p2_plot_pm),
+            ("_teo_p2_n_data",  self._p2_ct_n,  self._p2_plot_n),
         ]
-        for attr, curva in _map:
+        dibujadas = 0
+        for attr, curva, plot in _map:
             if hasattr(self, attr) and getattr(self, attr):
                 curva.setData(*getattr(self, attr))
+                plot.enableAutoRange()
+                plot.autoRange()
+                dibujadas += 1
+
+        if dibujadas:
+            señales.conexion_msg.emit(
+                f"Prueba 2: {dibujadas} curva(s) teórica(s) mostrada(s)"
+            )
 
     # ── Importar CSVs teóricos Prueba 2 (vs TL) ──────────────
     def _importar_csv_p2(self, data_attr: str, lbl_attr: str, titulo: str):
-        """Guarda datos teóricos P2; NO los grafica hasta pulsar Aplicar."""
+        """Guarda datos teóricos P2; se grafican cuando Salida cambia a ON."""
         ruta, _ = QFileDialog.getOpenFileName(
             self, f"Importar {titulo} teórico", "", "CSV (*.csv);;Todos (*)"
         )
         if not ruta:
             return
         try:
-            x, y = [], []
-            with open(ruta, newline="", encoding="utf-8") as f:
-                for row in csv.reader(f):
-                    if len(row) < 2:
-                        continue
-                    try:
-                        x.append(float(row[0])); y.append(float(row[1]))
-                    except ValueError:
-                        continue
-            setattr(self, data_attr, (x, y))   # guardado, no graficado aún
+            x, y = self._leer_csv_xy(ruta)
+            setattr(self, data_attr, (x, y))   # guardado, todavía oculto
             nombre = os.path.basename(ruta)
             lbl = getattr(self, lbl_attr)
             lbl.setText(f"✓ {nombre}")
             lbl.setStyleSheet("font-size:9px; color:#7EE787; padding-left:12px;")
             lbl.setToolTip(nombre)
-            señales.conexion_msg.emit(f"CSV teórico listo (se graficará al aplicar): {nombre}")
+            señales.conexion_msg.emit(
+                f"CSV teórico listo ({len(x)} puntos; se graficará al poner Salida ON): {nombre}"
+            )
+
+            # Si por alguna razón el usuario carga un archivo con la salida
+            # ya encendida, mostrarlo inmediatamente.
+            if self._btn_outp_p2.isChecked():
+                self._mostrar_teo_p2()
         except Exception as e:
             señales.conexion_msg.emit(f"Error CSV teórico: {e}")
 
