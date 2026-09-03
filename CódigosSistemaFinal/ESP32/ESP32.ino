@@ -7,7 +7,7 @@
 // ============================================================
 //       BANCO DE PRUEBAS MOTOR BLDC
 //
-// RPM + HX711 + KALMAN + PALANCA + TORQUE
+// RPM + HX711 + PALANCA + TORQUE
 // + USB SERIAL + WIFI + MQTT
 // ============================================================
 
@@ -106,19 +106,15 @@ const double MAGNET_TO_PIVOT_M = 0.060;
 
 const double PIVOT_TO_LOADCELL_M = 0.040;
 
-
 // ============================================================
-// FILTRO KALMAN GALGA
+// TORQUE ADICIONAL DEL BRAZO
 // ============================================================
-
-const double KALMAN_Q = 0.05;
-const double KALMAN_R = 1.00;
-
-double kalmanMassEstimate = 0.0;
-double kalmanErrorEstimate = 1.0;
-double kalmanGain = 0.0;
-
-bool kalmanInitialized = false;
+//
+// Torque constante producido por el brazo [N·m].
+// Este valor se SUMA al torque calculado a partir de la galga.
+//
+//
+const double TORQUE_BRAZO_NM = 0.02073;
 
 
 // ============================================================
@@ -164,68 +160,6 @@ float filteredRPM = 0.0;
 float finalRPM = 0.0;
 
 bool filterInitialized = false;
-
-
-// ============================================================
-// RESET KALMAN
-// ============================================================
-
-void resetKalman()
-{
-  kalmanMassEstimate = 0.0;
-  kalmanErrorEstimate = 1.0;
-  kalmanGain = 0.0;
-
-  kalmanInitialized = true;
-}
-
-
-// ============================================================
-// FILTRO KALMAN
-// ============================================================
-
-double applyKalman(double measurement)
-{
-  if (!kalmanInitialized)
-  {
-    kalmanMassEstimate = measurement;
-    kalmanErrorEstimate = 1.0;
-    kalmanGain = 1.0;
-
-    kalmanInitialized = true;
-
-    return kalmanMassEstimate;
-  }
-
-  // Prediccion
-  double predictedEstimate =
-    kalmanMassEstimate;
-
-  double predictedError =
-    kalmanErrorEstimate + KALMAN_Q;
-
-
-  // Ganancia Kalman
-  kalmanGain =
-    predictedError /
-    (predictedError + KALMAN_R);
-
-
-  // Correccion
-  kalmanMassEstimate =
-    predictedEstimate +
-    kalmanGain *
-    (measurement - predictedEstimate);
-
-
-  // Error actualizado
-  kalmanErrorEstimate =
-    (1.0 - kalmanGain) *
-    predictedError;
-
-
-  return kalmanMassEstimate;
-}
 
 
 // ============================================================
@@ -513,7 +447,6 @@ void configureLoadCellZero()
   }
 
 
-  resetKalman();
 
 
   Serial.println();
@@ -568,8 +501,7 @@ bool realizarTaraAutomatica()
 
   if (ok)
   {
-    resetKalman();
-    calibrado = true;   // habilitar medición en loop()
+      calibrado = true;   // habilitar medición en loop()
 
     Serial.print("CeroFinal = ");
     Serial.println(zeroRaw, 2);
@@ -1220,21 +1152,23 @@ void loop()
       );
 
 
-    double massUnfiltered_g = 0.0;
-
-    double massFiltered_g = 0.0;
+    double mass_g = 0.0;
 
     double forceLoadCell_N = 0.0;
 
     double forceMagnet_N = 0.0;
+
+    double torqueGalga_Nm = 0.0;
 
     double torque_Nm = 0.0;
 
 
     if (hxOK)
     {
-      // Masa
-      massUnfiltered_g =
+      // ======================================================
+      // MASA DIRECTA DE LA GALGA — SIN FILTRO KALMAN
+      // ======================================================
+      mass_g =
         MASS_SLOPE *
         (
           raw -
@@ -1242,24 +1176,17 @@ void loop()
         );
 
 
-      // Kalman
-      massFiltered_g =
-        applyKalman(
-          massUnfiltered_g
-        );
-
-
-      // Fuerza galga
+      // Fuerza medida por la galga
       forceLoadCell_N =
         (
-          massFiltered_g /
+          mass_g /
           1000.0
         )
         *
         GRAVITY;
 
 
-      // Fuerza equivalente en iman
+      // Fuerza equivalente en el iman
       forceMagnet_N =
         forceLoadCell_N *
         (
@@ -1268,10 +1195,16 @@ void loop()
         );
 
 
-      // Torque
-      torque_Nm =
+      // Torque medido por la galga
+      torqueGalga_Nm =
         forceMagnet_N *
         MAGNET_TO_PIVOT_M;
+
+
+      // Torque total = torque de galga + torque constante del brazo
+      torque_Nm =
+        torqueGalga_Nm +
+        TORQUE_BRAZO_NM;
     }
 
 
@@ -1327,11 +1260,11 @@ void loop()
 
 
     Serial.print(
-      "Masa Kalman       : "
+      "Masa galga        : "
     );
 
     Serial.print(
-      massFiltered_g,
+      mass_g,
       4
     );
 
@@ -1351,7 +1284,31 @@ void loop()
 
 
     Serial.print(
-      "Torque            : "
+      "Torque galga      : "
+    );
+
+    Serial.print(
+      torqueGalga_Nm,
+      8
+    );
+
+    Serial.println(" N*m");
+
+
+    Serial.print(
+      "Torque brazo      : "
+    );
+
+    Serial.print(
+      TORQUE_BRAZO_NM,
+      8
+    );
+
+    Serial.println(" N*m");
+
+
+    Serial.print(
+      "Torque TOTAL      : "
     );
 
     Serial.print(
@@ -1396,10 +1353,11 @@ void loop()
 
       "\"mass_unfiltered_g\":%.4f,"
       "\"mass_g\":%.4f,"
-      "\"kalman_gain\":%.5f,"
 
       "\"force_N\":%.6f,"
       "\"force_magnet_N\":%.6f,"
+      "\"torque_galga_Nm\":%.8f,"
+      "\"torque_brazo_Nm\":%.8f,"
       "\"torque_Nm\":%.8f,"
 
       "\"magnet_to_pivot_m\":%.3f,"
@@ -1445,12 +1403,13 @@ void loop()
       raw,
       zeroRaw,
 
-      massUnfiltered_g,
-      massFiltered_g,
-      kalmanGain,
+      mass_g,
+      mass_g,
 
       forceLoadCell_N,
       forceMagnet_N,
+      torqueGalga_Nm,
+      TORQUE_BRAZO_NM,
       torque_Nm,
 
       MAGNET_TO_PIVOT_M,
